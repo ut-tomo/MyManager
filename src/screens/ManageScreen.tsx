@@ -13,6 +13,8 @@ import {
   getIngredients,
   getMealTemplates,
   getProfile,
+  getTemplateIngredients,
+  setTemplateIngredients,
   softDelete,
   updateExercise,
   updateIngredient,
@@ -63,17 +65,10 @@ function loadModeFor(equipment: EquipmentType): { mode: Exercise['load_input_mod
   }
 }
 
-export function ManageScreen({ close, refresh }: { close: () => void; refresh: () => void }) {
+export function ManageScreen({ refresh }: { refresh: () => void }) {
   const [section, setSection] = useState<Section>('exercise');
   return (
-    <Screen
-      title="設定・管理"
-      right={
-        <Pressable onPress={close} style={styles.closeButton} hitSlop={8}>
-          <Ionicons name="close" size={22} color={colors.sub} />
-        </Pressable>
-      }
-    >
+    <Screen title="設定・管理" subtitle="種目・食材・テンプレート・店舗・目標・同期">
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 4 }}>
         {(
           [
@@ -259,14 +254,20 @@ function IngredientSection() {
 // ---- テンプレート ----
 function TemplateSection() {
   const [templates, setTemplates] = useState<MealTemplateRow[]>([]);
+  const [ingredients, setIngredients] = useState<IngredientRow[]>([]);
   const [editing, setEditing] = useState<MealTemplateRow | null>(null);
   const [name, setName] = useState('');
   const [kcal, setKcal] = useState('');
   const [protein, setProtein] = useState('');
   const [fat, setFat] = useState('');
   const [carbs, setCarbs] = useState('');
+  // 材料リスト（任意）。設定するとkcal/PFCは材料から自動計算になる。
+  const [rows, setRows] = useState<Array<{ ingredient: IngredientRow; grams: string }>>([]);
 
-  const load = useCallback(() => getMealTemplates().then(setTemplates), []);
+  const load = useCallback(async () => {
+    setTemplates(await getMealTemplates());
+    setIngredients(await getIngredients());
+  }, []);
   useEffect(() => {
     load();
   }, [load]);
@@ -278,37 +279,136 @@ function TemplateSection() {
     setProtein('');
     setFat('');
     setCarbs('');
+    setRows([]);
   }
 
+  const rowTotals = rows.reduce(
+    (sum, row) => {
+      const grams = Number(row.grams) || 0;
+      return {
+        kcal: sum.kcal + (row.ingredient.calories_per_100g * grams) / 100,
+        protein: sum.protein + (row.ingredient.protein_per_100g * grams) / 100,
+        fat: sum.fat + (row.ingredient.fat_per_100g * grams) / 100,
+        carbs: sum.carbs + (row.ingredient.carbs_per_100g * grams) / 100
+      };
+    },
+    { kcal: 0, protein: 0, fat: 0, carbs: 0 }
+  );
+
   async function save() {
-    if (!name.trim() || !Number(kcal)) return;
-    const input = {
-      name: name.trim(),
-      default_calories_kcal: Math.round(Number(kcal)),
-      default_protein_g: protein ? Number(protein) : null,
-      default_fat_g: fat ? Number(fat) : null,
-      default_carbs_g: carbs ? Number(carbs) : null
-    };
+    const hasRows = rows.some((row) => Number(row.grams) > 0);
+    if (!name.trim()) return;
+    if (!hasRows && !Number(kcal)) return;
+    const input = hasRows
+      ? {
+          name: name.trim(),
+          default_calories_kcal: Math.round(rowTotals.kcal),
+          default_protein_g: Math.round(rowTotals.protein * 10) / 10,
+          default_fat_g: Math.round(rowTotals.fat * 10) / 10,
+          default_carbs_g: Math.round(rowTotals.carbs * 10) / 10
+        }
+      : {
+          name: name.trim(),
+          default_calories_kcal: Math.round(Number(kcal)),
+          default_protein_g: protein ? Number(protein) : null,
+          default_fat_g: fat ? Number(fat) : null,
+          default_carbs_g: carbs ? Number(carbs) : null
+        };
+    let templateId: string;
     if (editing) {
       await updateMealTemplate(editing.id, input);
+      templateId = editing.id;
     } else {
-      await addMealTemplate(input);
+      templateId = await addMealTemplate(input);
     }
+    // 材料リストを置き換え（空にした場合はリンク解除のみでデフォルト値は保持）
+    await setTemplateIngredients(
+      templateId,
+      rows.map((row) => ({ ingredient: row.ingredient, grams: Number(row.grams) || 0 })).filter((row) => row.grams > 0)
+    );
     resetForm();
     await load();
   }
+
+  async function startEdit(template: MealTemplateRow) {
+    setEditing(template);
+    setName(template.name);
+    setKcal(String(template.default_calories_kcal));
+    setProtein(template.default_protein_g != null ? String(template.default_protein_g) : '');
+    setFat(template.default_fat_g != null ? String(template.default_fat_g) : '');
+    setCarbs(template.default_carbs_g != null ? String(template.default_carbs_g) : '');
+    const linked = await getTemplateIngredients(template.id);
+    setRows(
+      linked.map((row) => ({
+        ingredient: {
+          id: row.ingredient_id,
+          name: row.ingredient_name,
+          calories_per_100g: row.calories_per_100g,
+          protein_per_100g: row.protein_per_100g,
+          fat_per_100g: row.fat_per_100g,
+          carbs_per_100g: row.carbs_per_100g,
+          default_unit: 'g'
+        },
+        grams: String(row.amount_g)
+      }))
+    );
+  }
+
+  const hasRows = rows.length > 0;
 
   return (
     <>
       <Card>
         <Text style={styles.cardTitle}>{editing ? `「${editing.name}」を編集` : 'よく食べる食事をテンプレート化'}</Text>
         <Field label="テンプレート名" value={name} onChangeText={setName} placeholder="例: 鶏むね丼＋味噌汁" />
-        <View style={styles.rowGap}>
-          <Field label="kcal" value={kcal} onChangeText={setKcal} keyboardType="number-pad" placeholder="650" flex />
-          <Field label="P (g)" value={protein} onChangeText={setProtein} keyboardType="decimal-pad" placeholder="45" flex />
-          <Field label="F (g)" value={fat} onChangeText={setFat} keyboardType="decimal-pad" placeholder="12" flex />
-          <Field label="C (g)" value={carbs} onChangeText={setCarbs} keyboardType="decimal-pad" placeholder="85" flex />
-        </View>
+
+        {/* 材料リスト（任意） */}
+        <Text style={styles.fieldLabel}>材料から自動計算（任意）</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          {ingredients.map((ingredient) => (
+            <Chip
+              key={ingredient.id}
+              label={ingredient.name}
+              sub={`${ingredient.calories_per_100g}kcal/100g`}
+              onPress={() => {
+                if (rows.some((row) => row.ingredient.id === ingredient.id)) return;
+                setRows((prev) => [...prev, { ingredient, grams: '100' }]);
+              }}
+            />
+          ))}
+        </ScrollView>
+        {ingredients.length === 0 ? <Text style={styles.hint}>食材タブから食材を登録すると使えます</Text> : null}
+        {rows.map((row, index) => (
+          <View key={row.ingredient.id} style={styles.ingredientRow}>
+            <Text style={styles.listTitle}>{row.ingredient.name}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <View style={{ width: 88 }}>
+                <Field
+                  value={row.grams}
+                  onChangeText={(v) => setRows((prev) => prev.map((r, i) => (i === index ? { ...r, grams: v } : r)))}
+                  keyboardType="number-pad"
+                  placeholder="g"
+                />
+              </View>
+              <Text style={styles.hint}>g</Text>
+              <Pressable onPress={() => setRows((prev) => prev.filter((_, i) => i !== index))} hitSlop={6}>
+                <Ionicons name="close-circle" size={22} color={colors.faint} />
+              </Pressable>
+            </View>
+          </View>
+        ))}
+        {hasRows ? (
+          <Text style={styles.autoTotals}>
+            自動計算: {Math.round(rowTotals.kcal)}kcal / P{(Math.round(rowTotals.protein * 10) / 10)} F{(Math.round(rowTotals.fat * 10) / 10)} C{(Math.round(rowTotals.carbs * 10) / 10)}
+          </Text>
+        ) : (
+          <View style={styles.rowGap}>
+            <Field label="kcal" value={kcal} onChangeText={setKcal} keyboardType="number-pad" placeholder="650" flex />
+            <Field label="P (g)" value={protein} onChangeText={setProtein} keyboardType="decimal-pad" placeholder="45" flex />
+            <Field label="F (g)" value={fat} onChangeText={setFat} keyboardType="decimal-pad" placeholder="12" flex />
+            <Field label="C (g)" value={carbs} onChangeText={setCarbs} keyboardType="decimal-pad" placeholder="85" flex />
+          </View>
+        )}
         <View style={styles.rowGap}>
           {editing ? <Button label="キャンセル" variant="ghost" onPress={resetForm} style={{ flex: 1 }} /> : null}
           <Button label={editing ? '更新する' : '追加する'} icon="checkmark" onPress={save} style={{ flex: 2 }} />
@@ -320,14 +420,7 @@ function TemplateSection() {
           key={template.id}
           title={template.name}
           subtitle={`${template.default_calories_kcal}kcal / P${template.default_protein_g ?? '-'} F${template.default_fat_g ?? '-'} C${template.default_carbs_g ?? '-'}`}
-          onEdit={() => {
-            setEditing(template);
-            setName(template.name);
-            setKcal(String(template.default_calories_kcal));
-            setProtein(template.default_protein_g != null ? String(template.default_protein_g) : '');
-            setFat(template.default_fat_g != null ? String(template.default_fat_g) : '');
-            setCarbs(template.default_carbs_g != null ? String(template.default_carbs_g) : '');
-          }}
+          onEdit={() => startEdit(template)}
           onDelete={() => confirmDelete(template.name, async () => {
             await softDelete('meal_templates', template.id);
             await load();
@@ -360,7 +453,7 @@ function GymSection() {
       <Card>
         <Text style={styles.cardTitle}>ジム店舗を追加</Text>
         <Text style={styles.hint}>店舗を登録すると、マシンの重さ設定が違う店舗間でも記録を分けて比較できます</Text>
-        <Field label="店舗名" value={name} onChangeText={setName} placeholder="例: エニタイム湯島" />
+        <Field label="店舗名" value={name} onChangeText={setName} placeholder="例: Anytime Fitness 上野" />
         <Button label="追加する" icon="checkmark" onPress={save} style={{ marginTop: 12 }} />
       </Card>
       {gyms.map((gym) => (
@@ -520,6 +613,8 @@ const styles = StyleSheet.create({
   listRow: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 14, padding: 12, marginTop: 8 },
   listTitle: { fontSize: 15, fontWeight: '700', color: colors.ink },
   listSub: { fontSize: 12, color: colors.sub, marginTop: 2 },
+  ingredientRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, gap: 10 },
+  autoTotals: { marginTop: 12, fontWeight: '800', color: colors.primary },
   syncHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   syncStat: { alignItems: 'center', marginVertical: 16 },
   syncCount: { fontSize: 36, fontWeight: '800', color: colors.ink }

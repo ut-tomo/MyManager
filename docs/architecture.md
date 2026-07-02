@@ -29,15 +29,19 @@ MVP rule:
 
 ## Weekly review schedule
 
-- Sunday 20:00 JST: local notification prompt for reflection
+- Sunday 20:00 JST: local notification prompt for reflection (scheduled once at app start, dedup by title)
 - Sunday 22:00 JST: Supabase Scheduled Function calls `generate-weekly-review`
 - Review window: Monday 00:00 through Sunday 23:59 JST
-- Manual regeneration calls the same function with `force: true`
+- The app has no manual-generation UI (by design); the Review tab's "同期して更新" pulls generated reviews via normal sync
 
 ## App structure
 
-- `App.tsx`: 5-tab shell (ホーム / 筋トレ / 食事 / 体重 / レビュー) + 設定・管理 overlay (gear icon on Home)
-- `src/theme.ts`: design tokens (colors, radius, shadow)
+- `App.tsx`: 6-tab shell (ホーム / 筋トレ / 食事 / 体重 / レビュー / 設定), tab bar respects the bottom safe-area inset
+- `src/theme.ts`: design tokens (dark theme: near-black base, electric-lime accent, gold for top-set highlights)
+- Gym location is chosen at session start (chips above "Start Workout"); defaults seeded: Anytime Fitness 秋葉原 / 新御徒町 / 御茶ノ水
+- Machine/cable exercises support EquipmentInstance: per-exercise machine chips at the session's gym (inline "+ マシン追加"), auto-reassigns the machine last used at that gym; analysis has 全マシン/individual filter chips
+- Analysis charts show all gyms combined by default; long-pressing a bar reveals that day's detail incl. gym and machine names
+- Meal templates can link an ingredient list (meal_template_ingredients); defaults are recomputed from ingredients on save
 - `src/components/`: `Screen` wrapper, `ui.tsx` (Card/Button/Chip/Segmented/ProgressBar/Stepper/Field/Badge/confirmDelete), `charts.tsx` (dependency-free bar charts)
 - `src/screens/`: one file per tab + `ManageScreen` (種目 / 食材 / テンプレート / ジム店舗 / 目標 / 同期)
 - `src/db/client.ts`: all SQLite reads/writes; every mutation touches `updated_at` and demotes `synced` → `modified`
@@ -50,5 +54,4 @@ formatting was a bug that shifted pre-9am JST records to the previous day.
 
 - Auth and multi-user isolation are intentionally omitted for personal use
 - Conflict UI is represented in data model but not yet surfaced
-- Comparison filter is per gym location; per-machine (EquipmentInstance) filtering is in the schema but not yet in the input flow
-- Meal templates store default macros; linking an ingredient list to a template is not yet implemented (apply-time multiplier is supported)
+- Applying a template records scaled macros only; the linked ingredient list is not expanded into meal_ingredients

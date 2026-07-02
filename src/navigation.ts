@@ -1,1 +1,1 @@
-export type Tab = 'home' | 'workout' | 'meal' | 'weight' | 'review';
+export type Tab = 'home' | 'workout' | 'meal' | 'weight' | 'review' | 'settings';

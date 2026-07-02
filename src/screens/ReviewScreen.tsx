@@ -1,11 +1,10 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Screen } from '../components/Screen';
 import { Badge, Button, Card, EmptyState, Field, SectionTitle } from '../components/ui';
 import { getCurrentWeekReview, getWeeklyReviews, upsertWeeklyReflection, type WeeklyReviewRow } from '../db/client';
-import { generateWeeklyReview } from '../services/review';
-import { scheduleWeeklyReflectionPrompt } from '../services/notifications';
+import { syncNow } from '../services/sync';
 import { colors } from '../theme';
 import { addDaysISO, weekStartMondayISO } from '../utils/date';
 
@@ -25,7 +24,7 @@ export function ReviewScreen({ refreshKey }: { refreshKey: number }) {
   const [reflection, setReflection] = useState('');
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [reviews, setReviews] = useState<WeeklyReviewRow[]>([]);
-  const [generating, setGenerating] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -37,8 +36,6 @@ export function ReviewScreen({ refreshKey }: { refreshKey: number }) {
 
   useEffect(() => {
     load();
-    // 日曜20:00の「感想を書きませんか？」通知を予約（権限がなければ静かに無視）
-    scheduleWeeklyReflectionPrompt().catch(() => null);
   }, [load, refreshKey]);
 
   async function saveReflection() {
@@ -47,17 +44,18 @@ export function ReviewScreen({ refreshKey }: { refreshKey: number }) {
     await load();
   }
 
-  async function generate() {
-    setGenerating(true);
+  // レビューは毎週日曜22:00にサーバー側で自動生成される。
+  // ここでは同期して生成済みレビューを取り込むだけ。
+  async function fetchLatest() {
+    setSyncing(true);
     try {
-      await upsertWeeklyReflection(reflection);
-      const result = await generateWeeklyReview(reflection);
-      if (!result.ok) {
-        Alert.alert('生成できませんでした', result.message);
+      const result = await syncNow();
+      if (result.errors.length > 0) {
+        Alert.alert('同期できませんでした', `${result.errors[0].table}: ${result.errors[0].message}`);
       }
       await load();
     } finally {
-      setGenerating(false);
+      setSyncing(false);
     }
   }
 
@@ -76,23 +74,19 @@ export function ReviewScreen({ refreshKey }: { refreshKey: number }) {
           placeholder="例: 今週は脚が重かった。ベンチは調子良かったが、睡眠が短かった。"
           multiline
         />
-        <View style={styles.rowGap}>
-          <Button label="感想を保存" icon="document-text-outline" variant="secondary" onPress={saveReflection} style={{ flex: 1 }} />
-          <Button
-            label={generating ? '生成中…' : 'レビューを生成'}
-            icon="sparkles-outline"
-            onPress={generate}
-            disabled={generating}
-            style={{ flex: 1 }}
-          />
-        </View>
+        <Button label="感想を保存" icon="document-text-outline" onPress={saveReflection} style={{ marginTop: 12 }} />
         {savedAt ? <Text style={styles.savedText}>保存しました（{savedAt}）</Text> : null}
-        {generating ? <ActivityIndicator style={{ marginTop: 12 }} color={colors.primary} /> : null}
-        <Text style={styles.hint}>毎週日曜22:00 (JST) にも自動生成されます（Supabase側のスケジュール設定時）。</Text>
+        <Text style={styles.hint}>レビューは毎週日曜 22:00 に自動生成されます。</Text>
       </Card>
 
       {/* 過去レビュー */}
-      <SectionTitle>レビュー一覧</SectionTitle>
+      <SectionTitle
+        right={
+          <Button label={syncing ? '取得中…' : '同期して更新'} icon="cloud-download-outline" variant="ghost" size="sm" onPress={fetchLatest} disabled={syncing} />
+        }
+      >
+        レビュー一覧
+      </SectionTitle>
       {reviews.length === 0 ? <EmptyState icon="sparkles-outline" message="まだレビューがありません" /> : null}
       {reviews.map((review) => {
         const output = parseOutput(review.llm_output_json);

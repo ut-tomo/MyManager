@@ -54,8 +54,11 @@ export function formatKg(value: number): string {
   return `${value.toFixed(1)}kg`;
 }
 
+// Epley式による推定1RM。
+// reps = 1 は実測1RMそのものなので上乗せしない（素のEpley式だと 100kg×1 が 103.3 になってしまう）。
 export function epley1rm(weight: number, reps: number): number {
   if (!weight || !reps) return 0;
+  if (reps === 1) return Math.round(weight * 10) / 10;
   return Math.round(weight * (1 + reps / 30) * 10) / 10;
 }
 

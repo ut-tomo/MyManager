@@ -42,10 +42,10 @@ export function Button({
   const fontSize = size === 'lg' ? 17 : size === 'md' ? 15 : 13;
   const iconSize = size === 'lg' ? 22 : 18;
   const palette = {
-    primary: { bg: colors.primary, fg: '#FFFFFF', border: colors.primary },
-    secondary: { bg: colors.primarySoft, fg: colors.primary, border: colors.primaryBorder },
-    ghost: { bg: colors.card, fg: colors.ink, border: colors.border },
-    danger: { bg: colors.dangerSoft, fg: colors.danger, border: '#FECACA' }
+    primary: { bg: colors.primary, fg: '#0E1006', border: colors.primary, pressed: colors.primaryPressed },
+    secondary: { bg: '#1C1F26', fg: colors.ink, border: colors.borderStrong, pressed: '#242834' },
+    ghost: { bg: colors.card, fg: colors.sub, border: colors.border, pressed: '#1B1E25' },
+    danger: { bg: colors.dangerSoft, fg: colors.danger, border: '#4A2620', pressed: '#3A1B15' }
   }[variant];
   return (
     <Pressable
@@ -54,22 +54,24 @@ export function Button({
       style={({ pressed }) => [
         {
           minHeight: height,
-          borderRadius: radius.md,
-          backgroundColor: palette.bg,
+          borderRadius: size === 'lg' ? radius.lg : radius.md,
+          backgroundColor: pressed && !disabled ? palette.pressed : palette.bg,
           borderWidth: 1,
           borderColor: palette.border,
           alignItems: 'center',
           justifyContent: 'center',
           flexDirection: 'row',
-          gap: 7,
-          paddingHorizontal: 14,
-          opacity: disabled ? 0.4 : pressed ? 0.75 : 1
+          gap: 8,
+          paddingHorizontal: size === 'lg' ? 18 : 14,
+          opacity: disabled ? 0.42 : 1,
+          transform: [{ scale: pressed && !disabled ? 0.99 : 1 }]
         },
+        variant === 'primary' && shadow.button,
         style
       ]}
     >
       {icon ? <Ionicons name={icon} size={iconSize} color={palette.fg} /> : null}
-      <Text style={{ color: palette.fg, fontWeight: '700', fontSize }}>{label}</Text>
+      <Text style={{ color: palette.fg, fontWeight: '800', fontSize }}>{label}</Text>
     </Pressable>
   );
 }
@@ -243,7 +245,7 @@ export function Field({
 // ---- バッジ ----
 export function Badge({ label, tone = 'neutral' }: { label: string; tone?: 'neutral' | 'primary' | 'warn' | 'danger' | 'success' }) {
   const palette = {
-    neutral: { bg: '#F1F3F6', fg: colors.sub },
+    neutral: { bg: '#23262E', fg: colors.sub },
     primary: { bg: colors.primarySoft, fg: colors.primary },
     warn: { bg: colors.warnSoft, fg: colors.warn },
     danger: { bg: colors.dangerSoft, fg: colors.danger },
@@ -284,7 +286,7 @@ const styles = StyleSheet.create({
     ...shadow.card
   },
   sectionTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 20, marginBottom: 4 },
-  sectionTitle: { fontSize: 16, fontWeight: '800', color: colors.ink },
+  sectionTitle: { fontSize: 16, fontWeight: '800', color: colors.ink, letterSpacing: 0.4 },
   chip: {
     minHeight: 40,
     paddingHorizontal: 14,
@@ -301,22 +303,22 @@ const styles = StyleSheet.create({
   chipText: { color: colors.ink, fontWeight: '700', fontSize: 14 },
   chipTextSelected: { color: colors.primary },
   chipSub: { color: colors.faint, fontSize: 10, marginTop: 1 },
-  segmented: { flexDirection: 'row', backgroundColor: '#EAECF0', borderRadius: radius.md, padding: 3, marginTop: 10 },
+  segmented: { flexDirection: 'row', backgroundColor: '#1A1D23', borderRadius: radius.md, padding: 3, marginTop: 10, borderWidth: 1, borderColor: colors.border },
   segment: { flex: 1, minHeight: 38, borderRadius: radius.sm, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
-  segmentActive: { backgroundColor: colors.card, ...shadow.card },
+  segmentActive: { backgroundColor: '#2A2F3A' },
   segmentText: { color: colors.sub, fontWeight: '700', fontSize: 13 },
   segmentTextActive: { color: colors.primary },
   progressRow: { marginTop: 12 },
   progressHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
   progressLabel: { fontSize: 13, fontWeight: '800', color: colors.sub },
   progressValue: { fontSize: 13 },
-  progressTrack: { height: 10, borderRadius: 999, backgroundColor: '#EDEFF3', marginTop: 6, overflow: 'hidden' },
+  progressTrack: { height: 10, borderRadius: 999, backgroundColor: '#23262E', marginTop: 6, overflow: 'hidden' },
   progressFill: { height: '100%', borderRadius: 999 },
   stepper: { flex: 1 },
   stepperLabel: { fontSize: 12, fontWeight: '800', color: colors.sub, marginBottom: 4 },
   stepperRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   stepperButton: {
-    width: 44,
+    width: 38,
     height: 48,
     borderRadius: radius.md,
     backgroundColor: colors.primarySoft,

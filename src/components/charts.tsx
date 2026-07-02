@@ -1,18 +1,21 @@
 import React from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, radius } from '../theme';
 
 export type ChartPoint = { label: string; value: number };
 
 // 依存ライブラリなしのシンプルな棒グラフ。
 // 最新側（右端）を強調し、最小/最大とラベルを表示する。
+// onBarLongPress で各ポイントの詳細（店舗情報など）を親に通知できる。
 export function BarChart({
   title,
   points,
   color = colors.primary,
   unit = '',
   maxBars = 14,
-  baseline = 'zero'
+  baseline = 'zero',
+  onBarLongPress,
+  selectedIndex
 }: {
   title: string;
   points: ChartPoint[];
@@ -20,6 +23,8 @@ export function BarChart({
   unit?: string;
   maxBars?: number;
   baseline?: 'zero' | 'min'; // 体重のように変化幅が小さいものは 'min'
+  onBarLongPress?: (index: number) => void; // points配列上のインデックス
+  selectedIndex?: number | null;
 }) {
   const visible = points.slice(-maxBars);
   if (visible.length === 0) {
@@ -50,10 +55,22 @@ export function BarChart({
         {visible.map((point, index) => {
           const h = Math.max(4, ((point.value - floor) / span) * 92);
           const isLast = index === visible.length - 1;
+          const originalIndex = points.length - visible.length + index;
+          const isSelected = selectedIndex != null && selectedIndex === originalIndex;
           return (
-            <View key={`${point.label}-${index}`} style={styles.barColumn}>
-              <View style={[styles.bar, { height: h, backgroundColor: isLast ? color : `${color}55` }]} />
-            </View>
+            <Pressable
+              key={`${point.label}-${index}`}
+              style={styles.barColumn}
+              onLongPress={onBarLongPress ? () => onBarLongPress(originalIndex) : undefined}
+              delayLongPress={250}
+            >
+              <View
+                style={[
+                  styles.bar,
+                  { height: h, backgroundColor: isSelected ? colors.brass : isLast ? color : `${color}55` }
+                ]}
+              />
+            </Pressable>
           );
         })}
       </View>
@@ -124,7 +141,7 @@ const styles = StyleSheet.create({
   emptyText: { color: colors.faint, fontSize: 13, marginTop: 10 },
   hRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 },
   hLabel: { width: 76, fontSize: 12, fontWeight: '700', color: colors.sub },
-  hTrack: { flex: 1, height: 12, borderRadius: 999, backgroundColor: '#EDEFF3', overflow: 'hidden' },
+  hTrack: { flex: 1, height: 12, borderRadius: 999, backgroundColor: '#23262E', overflow: 'hidden' },
   hFill: { height: '100%', borderRadius: 999 },
   hValue: { width: 60, textAlign: 'right', fontSize: 12, fontWeight: '700', color: colors.ink }
 });

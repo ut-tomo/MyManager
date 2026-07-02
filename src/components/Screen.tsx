@@ -33,6 +33,6 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   content: { padding: 16, paddingBottom: 110 },
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
-  title: { fontSize: 26, fontWeight: '800', color: colors.ink },
-  subtitle: { fontSize: 13, color: colors.sub, marginTop: 2 }
+  title: { fontSize: 27, fontWeight: '800', color: colors.ink, letterSpacing: 0.3 },
+  subtitle: { fontSize: 13, color: colors.sub, marginTop: 3, letterSpacing: 0.3 }
 });

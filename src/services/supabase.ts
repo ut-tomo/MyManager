@@ -4,10 +4,25 @@ import { createClient } from '@supabase/supabase-js';
 
 const extra = Constants.expoConfig?.extra as { supabaseUrl?: string; supabaseAnonKey?: string } | undefined;
 
-export const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL ?? extra?.supabaseUrl ?? '';
-export const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? extra?.supabaseAnonKey ?? '';
+function readExpoEnv(value?: string): string {
+  if (!value) return '';
+  if (value.startsWith('${') && value.endsWith('}')) return '';
+  return value.trim();
+}
 
-export const supabase = supabaseUrl && supabaseAnonKey
+function isValidSupabaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname.includes('supabase');
+  } catch {
+    return false;
+  }
+}
+
+export const supabaseUrl = readExpoEnv(process.env.EXPO_PUBLIC_SUPABASE_URL) || readExpoEnv(extra?.supabaseUrl);
+export const supabaseAnonKey = readExpoEnv(process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY) || readExpoEnv(extra?.supabaseAnonKey);
+
+export const supabase = isValidSupabaseUrl(supabaseUrl) && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey, {
       auth: {
         storage: AsyncStorage,
@@ -17,4 +32,3 @@ export const supabase = supabaseUrl && supabaseAnonKey
       }
     })
   : null;
-

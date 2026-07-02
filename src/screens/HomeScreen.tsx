@@ -1,19 +1,22 @@
 import { Ionicons } from '@expo/vector-icons';
 import React, { useCallback, useEffect, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Screen } from '../components/Screen';
-import { Badge, Button, Card, ProgressBar, Stepper } from '../components/ui';
+import { Badge, Button, Card, Chip, Field, ProgressBar, Stepper } from '../components/ui';
 import {
   addBodyWeightLog,
+  addGymLocation,
   finishWorkoutSession,
   getActiveWorkoutSession,
   getBodyWeights,
   getDailyNutrition,
+  getGymLocations,
+  getLastGymLocationId,
   getProfile,
   getWeekWorkoutCount,
-  startWorkoutSession
+  startWorkoutSession,
+  type GymLocationRow
 } from '../db/client';
-import { scheduleWorkoutCheckoutReminder } from '../services/notifications';
 import { colors } from '../theme';
 import type { DailyNutritionSummary, UserProfile, WorkoutSession } from '../types';
 import { timeHM } from '../utils/date';
@@ -21,12 +24,10 @@ import type { Tab } from '../navigation';
 
 export function HomeScreen({
   go,
-  openManage,
   refreshKey,
   refresh
 }: {
   go: (tab: Tab) => void;
-  openManage: () => void;
   refreshKey: number;
   refresh: () => void;
 }) {
@@ -37,20 +38,29 @@ export function HomeScreen({
   const [weight, setWeight] = useState('');
   const [lastWeight, setLastWeight] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState('');
+  const [gyms, setGyms] = useState<GymLocationRow[]>([]);
+  const [selectedGymId, setSelectedGymId] = useState<string | null>(null);
+  const [gymFormOpen, setGymFormOpen] = useState(false);
+  const [newGymName, setNewGymName] = useState('');
 
   const load = useCallback(async () => {
-    const [p, n, a, c, weights] = await Promise.all([
+    const [p, n, a, c, weights, gymList, lastGym] = await Promise.all([
       getProfile(),
       getDailyNutrition(),
       getActiveWorkoutSession(),
       getWeekWorkoutCount(),
-      getBodyWeights(1)
+      getBodyWeights(1),
+      getGymLocations(),
+      getLastGymLocationId()
     ]);
     setProfile(p);
     setNutrition(n);
     setActive(a);
     setWeekCount(c);
     setLastWeight(weights[0]?.weight_kg ?? null);
+    setGyms(gymList);
+    // 前回使った店舗をデフォルト選択にして1タップで開始できるようにする（初回は明示的に選ばせる）
+    setSelectedGymId((prev) => prev ?? lastGym);
   }, []);
 
   useEffect(() => {
@@ -73,11 +83,23 @@ export function HomeScreen({
   }, [active]);
 
   async function handleEnterGym() {
-    await startWorkoutSession();
-    // 3時間経っても退館していない場合の確認通知（権限がなければ静かに無視）
-    scheduleWorkoutCheckoutReminder().catch(() => null);
+    // 店舗の選択は必須（マシン記録・店舗別比較の基盤になるため）
+    if (!selectedGymId) {
+      Alert.alert('店舗を選択してください', 'どのジムでのワークアウトかを選んでから開始します。');
+      return;
+    }
+    await startWorkoutSession(selectedGymId);
     await load();
     refresh();
+  }
+
+  async function saveGym() {
+    if (!newGymName.trim()) return;
+    const id = await addGymLocation(newGymName.trim());
+    setNewGymName('');
+    setGymFormOpen(false);
+    setSelectedGymId(id);
+    await load();
   }
 
   async function handleLeaveGym() {
@@ -98,13 +120,14 @@ export function HomeScreen({
   }
 
   const remainKcal = profile && nutrition ? profile.daily_calorie_target - nutrition.calories : null;
+  const activeGymName = active?.gym_location_id ? gyms.find((g) => g.id === active.gym_location_id)?.name ?? null : null;
 
   return (
     <Screen
       title="今日"
       subtitle={new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })}
       right={
-        <Pressable onPress={openManage} style={styles.gearButton} hitSlop={8}>
+        <Pressable onPress={() => go('settings')} style={styles.gearButton} hitSlop={8}>
           <Ionicons name="settings-outline" size={22} color={colors.sub} />
         </Pressable>
       }
@@ -124,7 +147,7 @@ export function HomeScreen({
         <ProgressBar label="Protein" current={Math.round((nutrition?.protein ?? 0) * 10) / 10} target={profile?.protein_target_g ?? 0} color={colors.protein} unit="g" missingCount={nutrition?.missingProtein} />
         <ProgressBar label="Fat" current={Math.round((nutrition?.fat ?? 0) * 10) / 10} target={profile?.fat_target_g ?? 0} color={colors.fat} unit="g" missingCount={nutrition?.missingFat} />
         <ProgressBar label="Carbs" current={Math.round((nutrition?.carbs ?? 0) * 10) / 10} target={profile?.carbs_target_g ?? 0} color={colors.carbs} unit="g" missingCount={nutrition?.missingCarbs} />
-        <Button label="食事を追加" icon="add-circle-outline" variant="secondary" onPress={() => go('meal')} style={{ marginTop: 14 }} />
+        <Button label="Add Meal" icon="add-circle-outline" variant="secondary" onPress={() => go('meal')} style={{ marginTop: 14 }} />
       </Card>
 
       {/* ジム */}
@@ -138,18 +161,32 @@ export function HomeScreen({
             <View style={styles.activeRow}>
               <View style={styles.pulseDot} />
               <Text style={styles.activeText}>
-                {timeHM(active.started_at)} 開始 ・ 経過 {elapsed}
+                Started {timeHM(active.started_at)} ・ {elapsed} elapsed
+                {activeGymName ? ` ・ ${activeGymName}` : ''}
               </Text>
             </View>
-            <Button label="ジムを出た" icon="exit-outline" size="lg" onPress={handleLeaveGym} style={{ marginTop: 12 }} />
-            <Button label="ワークアウトを記録する" icon="barbell-outline" variant="secondary" onPress={() => go('workout')} style={{ marginTop: 8 }} />
+            <Button label="Finish Workout" icon="stop-circle-outline" size="lg" onPress={handleLeaveGym} style={{ marginTop: 12 }} />
+            <Button label="Log Sets" icon="barbell-outline" variant="secondary" onPress={() => go('workout')} style={{ marginTop: 8 }} />
           </>
         ) : (
           <>
-            <Button label="ジムに入った" icon="enter-outline" size="lg" onPress={handleEnterGym} style={{ marginTop: 8 }} />
+            {/* 入った店舗を選んでからワンタップで開始（店舗は必須） */}
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 12 }}>
+              {gyms.map((gym) => (
+                <Chip key={gym.id} label={gym.name} selected={selectedGymId === gym.id} onPress={() => setSelectedGymId(gym.id)} />
+              ))}
+              <Chip label="+ ジム追加" onPress={() => setGymFormOpen((open) => !open)} />
+            </ScrollView>
+            {gymFormOpen ? (
+              <View style={styles.rowGap}>
+                <Field value={newGymName} onChangeText={setNewGymName} placeholder="例: Anytime Fitness 上野" flex />
+                <Button label="登録" size="sm" onPress={saveGym} />
+              </View>
+            ) : null}
+            <Button label="Start Workout" icon="play-circle-outline" size="lg" onPress={handleEnterGym} disabled={!selectedGymId} style={{ marginTop: 10 }} />
             <View style={styles.rowGap}>
-              <Button label="記録画面へ" icon="barbell-outline" variant="secondary" onPress={() => go('workout')} style={{ flex: 1 }} />
-              <Button label="時間を手動登録" icon="time-outline" variant="ghost" onPress={() => go('workout')} style={{ flex: 1 }} />
+              <Button label="Log Workout" icon="barbell-outline" variant="secondary" onPress={() => go('workout')} style={{ flex: 1 }} />
+              <Button label="Edit Time" icon="time-outline" variant="ghost" onPress={() => go('workout')} style={{ flex: 1 }} />
             </View>
           </>
         )}
@@ -163,7 +200,7 @@ export function HomeScreen({
         </View>
         <View style={styles.rowGap}>
           <Stepper label="kg" value={weight || (lastWeight != null ? lastWeight.toFixed(1) : '')} onChange={setWeight} step={0.1} decimals={1} />
-          <Button label="保存" icon="checkmark" onPress={saveWeight} style={{ alignSelf: 'flex-end', minWidth: 92 }} />
+          <Button label="Save" icon="checkmark" onPress={saveWeight} style={{ alignSelf: 'flex-end', minWidth: 92 }} />
         </View>
       </Card>
     </Screen>

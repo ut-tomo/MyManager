@@ -33,6 +33,8 @@ async function seedDefaults(): Promise<void> {
     );
   }
 
+  await seedGyms(now);
+
   const exerciseCount = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM exercises WHERE deleted_at IS NULL');
   if ((exerciseCount?.count ?? 0) > 0) return;
 
@@ -55,9 +57,27 @@ async function seedDefaults(): Promise<void> {
     );
   }
 
+}
+
+// デフォルトのジム店舗。既存DBにも名前が無ければ追加する。
+async function seedGyms(now: string): Promise<void> {
+  const defaults = ['Anytime Fitness 秋葉原', 'Anytime Fitness 新御徒町', 'Anytime Fitness 御茶ノ水'];
+  for (const name of defaults) {
+    const existing = await db.getFirstAsync<{ id: string }>(
+      `SELECT id FROM gym_locations WHERE name = ? AND deleted_at IS NULL LIMIT 1`,
+      [name]
+    );
+    if (!existing) {
+      await db.runAsync(
+        `INSERT INTO gym_locations (id, name, note, created_at, updated_at) VALUES (?, ?, NULL, ?, ?)`,
+        [newId('gym'), name, now, now]
+      );
+    }
+  }
+  // 旧バージョンでシードした未編集のサンプル店舗は取り下げる
   await db.runAsync(
-    `INSERT INTO gym_locations (id, name, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-    [newId('gym'), 'エニタイム湯島', '初期サンプル。編集または削除できます。', now, now]
+    `UPDATE gym_locations SET deleted_at = ?, updated_at = ? WHERE name = 'エニタイム湯島' AND note = '初期サンプル。編集または削除できます。' AND deleted_at IS NULL`,
+    [now, now]
   );
 }
 
@@ -106,14 +126,22 @@ export async function createExercise(input: Omit<Exercise, 'id'>): Promise<strin
   return id;
 }
 
-export async function startWorkoutSession(): Promise<string> {
+export async function startWorkoutSession(gymLocationId?: string | null): Promise<string> {
   const id = newId('ws');
   const now = nowISO();
   await db.runAsync(
-    `INSERT INTO workout_sessions (id, date, started_at, sync_status, created_at, updated_at) VALUES (?, ?, ?, 'local_only', ?, ?)`,
-    [id, todayISO(), now, now, now]
+    `INSERT INTO workout_sessions (id, date, gym_location_id, started_at, sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, 'local_only', ?, ?)`,
+    [id, todayISO(), gymLocationId ?? null, now, now, now]
   );
   return id;
+}
+
+// 前回のセッションで使った店舗（開始時のデフォルト選択に使う）
+export async function getLastGymLocationId(): Promise<string | null> {
+  const row = await db.getFirstAsync<{ gym_location_id: string | null }>(
+    `SELECT gym_location_id FROM workout_sessions WHERE deleted_at IS NULL AND gym_location_id IS NOT NULL ORDER BY date DESC, created_at DESC LIMIT 1`
+  );
+  return row?.gym_location_id ?? null;
 }
 
 export async function getActiveWorkoutSession(): Promise<WorkoutSession | null> {
@@ -166,9 +194,10 @@ export async function addWorkoutExercise(sessionId: string, exerciseId: string):
 
 export async function getWorkoutExercises(sessionId: string): Promise<WorkoutExercise[]> {
   return db.getAllAsync<WorkoutExercise>(
-    `SELECT we.*, e.name as exercise_name, e.muscle_group, e.volume_multiplier
+    `SELECT we.*, e.name as exercise_name, e.muscle_group, e.volume_multiplier, e.equipment_type, ei.display_name as equipment_name
      FROM workout_exercises we
      JOIN exercises e ON e.id = we.exercise_id
+     LEFT JOIN equipment_instances ei ON ei.id = we.equipment_instance_id
      WHERE we.workout_session_id = ? AND we.deleted_at IS NULL
      ORDER BY we.order_index`,
     [sessionId]
@@ -413,6 +442,66 @@ export async function addMealTemplate(input: Omit<MealTemplateRow, 'id'>): Promi
   return id;
 }
 
+// ---- テンプレートの材料リスト ----
+export type TemplateIngredientRow = {
+  id: string;
+  meal_template_id: string;
+  ingredient_id: string;
+  amount_g: number;
+  ingredient_name: string;
+  calories_per_100g: number;
+  protein_per_100g: number;
+  fat_per_100g: number;
+  carbs_per_100g: number;
+};
+
+export async function getTemplateIngredients(templateId: string): Promise<TemplateIngredientRow[]> {
+  return db.getAllAsync<TemplateIngredientRow>(
+    `SELECT ti.id, ti.meal_template_id, ti.ingredient_id, ti.amount_g,
+            i.name as ingredient_name, i.calories_per_100g, i.protein_per_100g, i.fat_per_100g, i.carbs_per_100g
+     FROM meal_template_ingredients ti
+     JOIN ingredients i ON i.id = ti.ingredient_id
+     WHERE ti.meal_template_id = ? AND ti.deleted_at IS NULL AND i.deleted_at IS NULL
+     ORDER BY ti.created_at`,
+    [templateId]
+  );
+}
+
+// 材料リストを丸ごと置き換え、テンプレートのデフォルトkcal/PFCを材料から再計算して保存する
+export async function setTemplateIngredients(
+  templateId: string,
+  rows: Array<{ ingredient: IngredientRow; grams: number }>
+): Promise<void> {
+  const now = nowISO();
+  await db.runAsync(
+    `UPDATE meal_template_ingredients SET deleted_at = ?, sync_status = 'modified', updated_at = ? WHERE meal_template_id = ? AND deleted_at IS NULL`,
+    [now, now, templateId]
+  );
+  for (const row of rows) {
+    await db.runAsync(
+      `INSERT INTO meal_template_ingredients (id, meal_template_id, ingredient_id, amount_g, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [newId('ti'), templateId, row.ingredient.id, row.grams, now, now]
+    );
+  }
+  if (rows.length > 0) {
+    const totals = rows.reduce(
+      (sum, row) => ({
+        kcal: sum.kcal + (row.ingredient.calories_per_100g * row.grams) / 100,
+        protein: sum.protein + (row.ingredient.protein_per_100g * row.grams) / 100,
+        fat: sum.fat + (row.ingredient.fat_per_100g * row.grams) / 100,
+        carbs: sum.carbs + (row.ingredient.carbs_per_100g * row.grams) / 100
+      }),
+      { kcal: 0, protein: 0, fat: 0, carbs: 0 }
+    );
+    await db.runAsync(
+      `UPDATE meal_templates SET default_calories_kcal = ?, default_protein_g = ?, default_fat_g = ?, default_carbs_g = ?,
+       sync_status = CASE WHEN sync_status = 'synced' THEN 'modified' ELSE sync_status END, updated_at = ? WHERE id = ?`,
+      [Math.round(totals.kcal), round1(totals.protein), round1(totals.fat), round1(totals.carbs), now, templateId]
+    );
+  }
+}
+
 export async function getDailyNutrition(date = todayISO()): Promise<DailyNutritionSummary> {
   const meals = await getMeals(date);
   return meals.reduce<DailyNutritionSummary>(
@@ -454,10 +543,23 @@ export async function getBodyWeights(limit = 30): Promise<Array<BodyWeightLog & 
   }).reverse();
 }
 
-export async function getExerciseHistory(exerciseId: string, days = 30, gymLocationId?: string | null): Promise<ExerciseHistoryItem[]> {
+export async function getExerciseHistory(
+  exerciseId: string,
+  days = 30,
+  gymLocationId?: string | null,
+  equipmentInstanceId?: string | null
+): Promise<ExerciseHistoryItem[]> {
   const since = addDaysISO(todayISO(), -days);
-  const gymFilter = gymLocationId ? 'AND ws.gym_location_id = ?' : '';
-  const params: Array<string | number> = gymLocationId ? [exerciseId, since, gymLocationId] : [exerciseId, since];
+  const filters: string[] = [];
+  const params: Array<string | number> = [exerciseId, since];
+  if (gymLocationId) {
+    filters.push('AND ws.gym_location_id = ?');
+    params.push(gymLocationId);
+  }
+  if (equipmentInstanceId) {
+    filters.push('AND we.equipment_instance_id = ?');
+    params.push(equipmentInstanceId);
+  }
   const rows = await db.getAllAsync<{
     date: string;
     exercise_name: string;
@@ -465,13 +567,18 @@ export async function getExerciseHistory(exerciseId: string, days = 30, gymLocat
     reps: number;
     is_selected_top_set: number;
     volume_multiplier: number;
+    gym_name: string | null;
+    machine_name: string | null;
   }>(
-    `SELECT ws.date, e.name as exercise_name, s.weight, s.reps, s.is_selected_top_set, e.volume_multiplier
+    `SELECT ws.date, e.name as exercise_name, s.weight, s.reps, s.is_selected_top_set, e.volume_multiplier,
+            gl.name as gym_name, ei.display_name as machine_name
      FROM workout_sets s
      JOIN workout_exercises we ON we.id = s.workout_exercise_id
      JOIN workout_sessions ws ON ws.id = we.workout_session_id
      JOIN exercises e ON e.id = we.exercise_id
-     WHERE e.id = ? AND ws.date >= ? AND s.deleted_at IS NULL AND we.deleted_at IS NULL AND ws.deleted_at IS NULL ${gymFilter}
+     LEFT JOIN gym_locations gl ON gl.id = ws.gym_location_id
+     LEFT JOIN equipment_instances ei ON ei.id = we.equipment_instance_id
+     WHERE e.id = ? AND ws.date >= ? AND s.deleted_at IS NULL AND we.deleted_at IS NULL AND ws.deleted_at IS NULL ${filters.join(' ')}
      ORDER BY ws.date DESC, s.order_index DESC`,
     params
   );
@@ -484,9 +591,13 @@ export async function getExerciseHistory(exerciseId: string, days = 30, gymLocat
       total_volume: 0,
       top_weight: null,
       top_reps: null,
-      estimated_1rm: null
+      estimated_1rm: null,
+      gyms: [],
+      machines: []
     };
     current.total_volume += row.weight * row.reps * row.volume_multiplier;
+    if (row.gym_name && !current.gyms.includes(row.gym_name)) current.gyms.push(row.gym_name);
+    if (row.machine_name && !current.machines.includes(row.machine_name)) current.machines.push(row.machine_name);
     if (row.is_selected_top_set || current.top_weight == null || epley1rm(row.weight, row.reps) > (current.estimated_1rm ?? 0)) {
       current.top_weight = row.weight;
       current.top_reps = row.reps;
@@ -500,14 +611,20 @@ export async function getExerciseHistory(exerciseId: string, days = 30, gymLocat
   }));
 }
 
-export async function getExerciseCharts(exerciseId: string, gymLocationId?: string | null): Promise<Array<{ date: string; top_weight: number; top_reps: number; estimated_1rm: number; volume: number }>> {
-  const history = await getExerciseHistory(exerciseId, 90, gymLocationId);
+export async function getExerciseCharts(
+  exerciseId: string,
+  gymLocationId?: string | null,
+  equipmentInstanceId?: string | null
+): Promise<Array<{ date: string; top_weight: number; top_reps: number; estimated_1rm: number; volume: number; gyms: string[]; machines: string[] }>> {
+  const history = await getExerciseHistory(exerciseId, 90, gymLocationId, equipmentInstanceId);
   return history.reverse().map((item) => ({
     date: item.date,
     top_weight: item.top_weight ?? 0,
     top_reps: item.top_reps ?? 0,
     estimated_1rm: item.estimated_1rm ?? 0,
-    volume: Math.round(item.total_volume)
+    volume: Math.round(item.total_volume),
+    gyms: item.gyms,
+    machines: item.machines
   }));
 }
 
@@ -664,6 +781,68 @@ export async function addGymLocation(name: string, note?: string): Promise<strin
     [id, name, note ?? null, now, now]
   );
   return id;
+}
+
+// ---- マシン個体（EquipmentInstance）----
+// 同じ種目でも店舗・マシンごとに重さの意味が変わるため、個体単位で記録・比較する。
+export type EquipmentInstanceRow = {
+  id: string;
+  gym_location_id: string;
+  exercise_id: string;
+  display_name: string;
+  brand?: string | null;
+  note?: string | null;
+  gym_name?: string;
+};
+
+export async function getEquipmentInstances(exerciseId: string, gymLocationId?: string | null): Promise<EquipmentInstanceRow[]> {
+  const gymFilter = gymLocationId ? 'AND ei.gym_location_id = ?' : '';
+  const params = gymLocationId ? [exerciseId, gymLocationId] : [exerciseId];
+  return db.getAllAsync<EquipmentInstanceRow>(
+    `SELECT ei.*, gl.name as gym_name
+     FROM equipment_instances ei
+     JOIN gym_locations gl ON gl.id = ei.gym_location_id
+     WHERE ei.exercise_id = ? AND ei.deleted_at IS NULL AND gl.deleted_at IS NULL ${gymFilter}
+     ORDER BY gl.name, ei.display_name`,
+    params
+  );
+}
+
+export async function addEquipmentInstance(input: {
+  exerciseId: string;
+  gymLocationId: string;
+  displayName: string;
+  brand?: string;
+}): Promise<string> {
+  const id = newId('eq');
+  const now = nowISO();
+  await db.runAsync(
+    `INSERT INTO equipment_instances (id, gym_location_id, exercise_id, display_name, brand, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, input.gymLocationId, input.exerciseId, input.displayName, input.brand ?? null, now, now]
+  );
+  return id;
+}
+
+// 同じ店舗で前回使ったマシン（追加時の自動プレフィル用）
+export async function getLastEquipmentInstanceId(exerciseId: string, gymLocationId: string): Promise<string | null> {
+  const row = await db.getFirstAsync<{ equipment_instance_id: string | null }>(
+    `SELECT we.equipment_instance_id
+     FROM workout_exercises we
+     JOIN workout_sessions ws ON ws.id = we.workout_session_id
+     WHERE we.exercise_id = ? AND ws.gym_location_id = ? AND we.equipment_instance_id IS NOT NULL
+       AND we.deleted_at IS NULL AND ws.deleted_at IS NULL
+     ORDER BY ws.date DESC, we.created_at DESC LIMIT 1`,
+    [exerciseId, gymLocationId]
+  );
+  return row?.equipment_instance_id ?? null;
+}
+
+export async function setWorkoutExerciseEquipment(workoutExerciseId: string, equipmentInstanceId: string | null): Promise<void> {
+  await db.runAsync(
+    `UPDATE workout_exercises SET equipment_instance_id = ?, ${TOUCH}, updated_at = ? WHERE id = ?`,
+    [equipmentInstanceId, nowISO(), workoutExerciseId]
+  );
 }
 
 // SetBlock 一覧 + 達成状況 (completed / partial / failed)

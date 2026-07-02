@@ -26,12 +26,17 @@ export async function requestNotificationPermission(): Promise<boolean> {
   return next.granted;
 }
 
+const REFLECTION_PROMPT_TITLE = '今週の感想を書きませんか？';
+
+// 日曜20:00の感想リマインド。多重登録を防ぐため、既に予約済みなら何もしない。
 export async function scheduleWeeklyReflectionPrompt(): Promise<string | null> {
   const granted = await requestNotificationPermission();
   if (!granted) return null;
+  const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+  if (scheduled.some((n) => n.content.title === REFLECTION_PROMPT_TITLE)) return null;
   return Notifications.scheduleNotificationAsync({
     content: {
-      title: '今週の感想を書きませんか？',
+      title: REFLECTION_PROMPT_TITLE,
       body: '週次レビューに渡すメモを短く残しておけます。'
     },
     trigger: { weekday: 1, hour: 20, minute: 0, repeats: true } as any

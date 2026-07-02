@@ -50,6 +50,8 @@ export type WorkoutExercise = {
   exercise_name?: string;
   muscle_group?: string;
   volume_multiplier?: number;
+  equipment_type?: EquipmentType;
+  equipment_name?: string | null; // 選択中のマシン表示名
 };
 
 export type WorkoutSet = {
@@ -124,4 +126,6 @@ export type ExerciseHistoryItem = {
   top_reps?: number | null;
   estimated_1rm?: number | null;
   total_volume: number;
+  gyms: string[]; // その日に記録した店舗名（通常は1つ）
+  machines: string[]; // その日に使ったマシン名（マシン種目のみ）
 };

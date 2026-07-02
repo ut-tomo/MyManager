@@ -13,6 +13,7 @@ const SYNC_TABLES = [
   'ingredients',
   'meal_ingredients',
   'meal_templates',
+  'meal_template_ingredients',
   'body_weight_logs',
   'user_profile',
   'weekly_reviews',

@@ -163,6 +163,17 @@ CREATE TABLE IF NOT EXISTS meal_templates (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS meal_template_ingredients (
+  id TEXT PRIMARY KEY,
+  meal_template_id TEXT NOT NULL REFERENCES meal_templates(id) ON DELETE CASCADE,
+  ingredient_id TEXT NOT NULL REFERENCES ingredients(id),
+  amount_g REAL NOT NULL,
+  sync_status TEXT NOT NULL DEFAULT 'local_only',
+  deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS body_weight_logs (
   id TEXT PRIMARY KEY,
   date TEXT NOT NULL,

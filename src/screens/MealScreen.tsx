@@ -409,7 +409,7 @@ const styles = StyleSheet.create({
   fieldLabel: { fontSize: 12, fontWeight: '800', color: colors.sub, marginTop: 12 },
   editingBanner: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
   cancelText: { color: colors.danger, fontWeight: '700', fontSize: 13 },
-  pickRow: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 52, borderBottomWidth: 1, borderBottomColor: '#F1F3F6', paddingVertical: 8 },
+  pickRow: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 52, borderBottomWidth: 1, borderBottomColor: '#23262E', paddingVertical: 8 },
   pickTitle: { fontSize: 15, fontWeight: '700', color: colors.ink },
   pickSub: { fontSize: 12, color: colors.sub, marginTop: 2 },
   ingredientRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, gap: 10 },

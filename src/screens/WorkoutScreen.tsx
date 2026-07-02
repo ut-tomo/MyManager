@@ -5,15 +5,20 @@ import { Screen } from '../components/Screen';
 import { BarChart, HBarList } from '../components/charts';
 import { Badge, Button, Card, Chip, EmptyState, Field, Segmented, SectionTitle, Stepper, confirmDelete } from '../components/ui';
 import {
+  addEquipmentInstance,
+  addGymLocation,
   addSameWeightBlock,
   addWorkoutExercise,
   addWorkoutSet,
   finishWorkoutSession,
   getActiveWorkoutSession,
+  getEquipmentInstances,
   getExerciseCharts,
   getExerciseHistory,
   getExercises,
   getGymLocations,
+  getLastEquipmentInstanceId,
+  getLastGymLocationId,
   getLastPerformance,
   getMuscleVolumeThisWeek,
   getRecentSessions,
@@ -21,29 +26,36 @@ import {
   getWeeklyFrequency,
   getWorkoutExercises,
   getWorkoutSets,
+  setWorkoutExerciseEquipment,
   softDelete,
   startWorkoutSession,
   toggleTopSet,
   updateSessionMeta,
   updateSessionTimes,
+  type EquipmentInstanceRow,
   type GymLocationRow,
   type SetBlockSummary
 } from '../db/client';
-import { colors } from '../theme';
+import { colors, radius } from '../theme';
 import type { Exercise, ExerciseHistoryItem, WorkoutExercise, WorkoutSession, WorkoutSet } from '../types';
 import { combineDateTime, timeHM } from '../utils/date';
 
 const OUTCOME_LABEL: Record<string, string> = {
-  completed: '成功',
-  failed: '潰れた',
-  easy: '余力あり',
-  stopped_before_failure: '手前で終了',
+  completed: 'Done',
+  failed: 'Failed',
+  easy: 'Easy',
+  stopped_before_failure: 'Stopped',
   assisted: '補助あり'
 };
 
 const MUSCLE_LABEL: Record<string, string> = {
   chest: '胸', back: '背中', legs: '脚', shoulders: '肩', arms: '腕', core: '体幹', other: 'その他'
 };
+
+// マシン個体の記録対象になる器具タイプ
+function isMachineType(equipmentType?: string): boolean {
+  return equipmentType === 'machine' || equipmentType === 'cable';
+}
 
 type InputState = { weight: string; reps: string; step: number; blockSets: string };
 
@@ -76,6 +88,13 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
   const [setsByExercise, setSetsByExercise] = useState<Record<string, WorkoutSet[]>>({});
   const [blocksByExercise, setBlocksByExercise] = useState<Record<string, SetBlockSummary[]>>({});
   const [inputs, setInputs] = useState<Record<string, InputState>>({});
+  const [selectedGymId, setSelectedGymId] = useState<string | null>(null);
+  const [gymFormOpen, setGymFormOpen] = useState(false);
+  const [newGymName, setNewGymName] = useState('');
+  // マシン個体: 種目ID → セッション店舗のマシン一覧
+  const [machinesByExercise, setMachinesByExercise] = useState<Record<string, EquipmentInstanceRow[]>>({});
+  const [machineFormFor, setMachineFormFor] = useState<string | null>(null); // WorkoutExercise.id
+  const [machineName, setMachineName] = useState('');
   const [timeEditOpen, setTimeEditOpen] = useState(false);
   const [startHM, setStartHM] = useState('');
   const [endHM, setEndHM] = useState('');
@@ -86,6 +105,9 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
     setActive(a);
     setSessions(await getRecentSessions(5));
     setGyms(await getGymLocations());
+    // 前回使った店舗をデフォルト選択にする
+    const lastGym = await getLastGymLocationId();
+    setSelectedGymId((prev) => prev ?? lastGym);
     if (a) {
       const wes = await getWorkoutExercises(a.id);
       setWorkoutExercises(wes);
@@ -93,10 +115,22 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
       setSetsByExercise(Object.fromEntries(setEntries));
       const blockEntries = await Promise.all(wes.map(async (we) => [we.id, await getSetBlocks(we.id)] as const));
       setBlocksByExercise(Object.fromEntries(blockEntries));
+      // セッション店舗のマシン一覧（マシン種目のみ）
+      if (a.gym_location_id) {
+        const machineExercises = wes.filter((we) => isMachineType(we.equipment_type));
+        const uniqueIds = [...new Set(machineExercises.map((we) => we.exercise_id))];
+        const machineEntries = await Promise.all(
+          uniqueIds.map(async (exId) => [exId, await getEquipmentInstances(exId, a.gym_location_id)] as const)
+        );
+        setMachinesByExercise(Object.fromEntries(machineEntries));
+      } else {
+        setMachinesByExercise({});
+      }
     } else {
       setWorkoutExercises([]);
       setSetsByExercise({});
       setBlocksByExercise({});
+      setMachinesByExercise({});
     }
   }, []);
 
@@ -116,12 +150,26 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
     setInputs((prev) => ({ ...prev, [weId]: { ...getInput(weId), ...patch } }));
   }
 
-  async function ensureSession(): Promise<string> {
+  // 店舗未選択ではセッションを開始しない（マシン記録・店舗別比較の基盤になるため必須）
+  async function ensureSession(): Promise<string | null> {
     if (active) return active.id;
-    const id = await startWorkoutSession();
+    if (!selectedGymId) {
+      Alert.alert('店舗を選択してください', 'どのジムでのワークアウトかを選んでから開始します。');
+      return null;
+    }
+    const id = await startWorkoutSession(selectedGymId);
     await load();
     refresh();
     return id;
+  }
+
+  async function saveGym() {
+    if (!newGymName.trim()) return;
+    const id = await addGymLocation(newGymName.trim());
+    setNewGymName('');
+    setGymFormOpen(false);
+    setSelectedGymId(id);
+    await load();
   }
 
   async function showPreview(exercise: Exercise) {
@@ -130,14 +178,39 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
 
   async function addToSession(exercise: Exercise) {
     const sessionId = await ensureSession();
+    if (!sessionId) return;
     const weId = await addWorkoutExercise(sessionId, exercise.id);
     // 前回の重量・回数をプレフィルして入力を高速化
     const last = await getLastPerformance(exercise.id);
     if (last) {
       setInputs((prev) => ({ ...prev, [weId]: { weight: String(last.weight), reps: String(last.reps), step: 2.5, blockSets: '3' } }));
     }
+    // マシン種目は、同じ店舗で前回使ったマシン（なければ唯一のマシン）を自動選択
+    const session = await getActiveWorkoutSession();
+    if (isMachineType(exercise.equipment_type) && session?.gym_location_id) {
+      const lastMachine = await getLastEquipmentInstanceId(exercise.id, session.gym_location_id);
+      if (lastMachine) {
+        await setWorkoutExerciseEquipment(weId, lastMachine);
+      } else {
+        const instances = await getEquipmentInstances(exercise.id, session.gym_location_id);
+        if (instances.length === 1) await setWorkoutExerciseEquipment(weId, instances[0].id);
+      }
+    }
     setPreview(null);
     setQuery('');
+    await load();
+  }
+
+  async function saveMachine(we: WorkoutExercise) {
+    if (!machineName.trim() || !active?.gym_location_id) return;
+    const id = await addEquipmentInstance({
+      exerciseId: we.exercise_id,
+      gymLocationId: active.gym_location_id,
+      displayName: machineName.trim()
+    });
+    await setWorkoutExerciseEquipment(we.id, id);
+    setMachineName('');
+    setMachineFormFor(null);
     await load();
   }
 
@@ -196,7 +269,7 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
             <View style={styles.sessionHeader}>
               <View style={styles.activeRow}>
                 <View style={styles.pulseDot} />
-                <Text style={styles.sessionTitle}>セッション進行中</Text>
+                <Text style={styles.sessionTitle}>Workout in progress</Text>
               </View>
               <Badge label={active.sync_status === 'synced' ? '同期済み' : '未同期'} tone={active.sync_status === 'synced' ? 'success' : 'warn'} />
             </View>
@@ -219,8 +292,8 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
             </ScrollView>
             <View style={styles.rowGap}>
               <Button
-                label="ジムを出た"
-                icon="exit-outline"
+                label="Finish Workout"
+                icon="stop-circle-outline"
                 onPress={async () => {
                   await finishWorkoutSession(active.id);
                   await load();
@@ -228,7 +301,7 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
                 }}
                 style={{ flex: 1 }}
               />
-              <Button label="時間を編集" icon="time-outline" variant="ghost" onPress={() => {
+              <Button label="Edit Time" icon="time-outline" variant="ghost" onPress={() => {
                 setStartHM(timeHM(active.started_at));
                 setEndHM(timeHM(active.ended_at));
                 setDurationText(active.duration_minutes != null ? String(active.duration_minutes) : '');
@@ -242,14 +315,27 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
                   <Field label="終了 (HH:MM)" value={endHM} onChangeText={setEndHM} placeholder="20:00" flex />
                   <Field label="時間(分)" value={durationText} onChangeText={setDurationText} placeholder="90" keyboardType="number-pad" flex />
                 </View>
-                <Button label="時間を保存" size="sm" onPress={saveTimes} style={{ marginTop: 10 }} />
+                <Button label="Save Time" size="sm" onPress={saveTimes} style={{ marginTop: 10 }} />
               </View>
             ) : null}
           </>
         ) : (
           <>
-            <Text style={styles.sessionTitle}>今日のセッション</Text>
-            <Button label="ジムに入った（セッション開始）" icon="enter-outline" size="lg" onPress={ensureSession} style={{ marginTop: 12 }} />
+            <Text style={styles.sessionTitle}>今日のワークアウト</Text>
+            <Text style={styles.hint}>入った店舗を選んで開始してください（必須）</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 10 }}>
+              {gyms.map((gym) => (
+                <Chip key={gym.id} label={gym.name} selected={selectedGymId === gym.id} onPress={() => setSelectedGymId(gym.id)} />
+              ))}
+              <Chip label="+ ジム追加" onPress={() => setGymFormOpen((open) => !open)} />
+            </ScrollView>
+            {gymFormOpen ? (
+              <View style={styles.rowGap}>
+                <Field value={newGymName} onChangeText={setNewGymName} placeholder="例: Anytime Fitness 上野" flex />
+                <Button label="登録" size="sm" onPress={saveGym} />
+              </View>
+            ) : null}
+            <Button label="Start Workout" icon="play-circle-outline" size="lg" onPress={ensureSession} disabled={!selectedGymId} style={{ marginTop: 12 }} />
             <Text style={styles.hint}>押し忘れても後から時間を編集できます</Text>
           </>
         )}
@@ -288,7 +374,7 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
               </Text>
             ))
           )}
-          <Button label="今日のセッションに追加" icon="add" onPress={() => addToSession(preview.exercise)} style={{ marginTop: 12 }} />
+          <Button label="Add to Workout" icon="add" onPress={() => addToSession(preview.exercise)} style={{ marginTop: 12 }} />
         </Card>
       ) : null}
 
@@ -315,10 +401,46 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
               </Pressable>
             </View>
 
+            {/* マシン選択（マシン・ケーブル種目のみ） */}
+            {isMachineType(we.equipment_type) ? (
+              active?.gym_location_id ? (
+                <>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 10 }}>
+                    {(machinesByExercise[we.exercise_id] ?? []).map((machine) => (
+                      <Chip
+                        key={machine.id}
+                        label={machine.display_name}
+                        selected={we.equipment_instance_id === machine.id}
+                        onPress={async () => {
+                          await setWorkoutExerciseEquipment(we.id, we.equipment_instance_id === machine.id ? null : machine.id);
+                          await load();
+                        }}
+                      />
+                    ))}
+                    <Chip
+                      label="+ マシン追加"
+                      onPress={() => {
+                        setMachineFormFor(machineFormFor === we.id ? null : we.id);
+                        setMachineName('');
+                      }}
+                    />
+                  </ScrollView>
+                  {machineFormFor === we.id ? (
+                    <View style={styles.rowGap}>
+                      <Field value={machineName} onChangeText={setMachineName} placeholder="例: ハンマー系ラットプル 左奥" flex />
+                      <Button label="登録" size="sm" onPress={() => saveMachine(we)} />
+                    </View>
+                  ) : null}
+                </>
+              ) : (
+                <Text style={styles.hint}>セッションの店舗を選択するとマシンを記録できます</Text>
+              )
+            ) : null}
+
             {/* 重量・回数入力 */}
             <View style={styles.rowGap}>
-              <Stepper label={`重量 kg（±${input.step}）`} value={input.weight} onChange={(v) => setInput(we.id, { weight: v })} step={input.step} />
-              <Stepper label="回数" value={input.reps} onChange={(v) => setInput(we.id, { reps: v })} step={1} decimals={0} min={1} />
+              <Stepper label={`kg ±${input.step}`} value={input.weight} onChange={(v) => setInput(we.id, { weight: v })} step={input.step} />
+              <Stepper label="回" value={input.reps} onChange={(v) => setInput(we.id, { reps: v })} step={1} decimals={0} min={1} />
             </View>
             <View style={styles.stepToggleRow}>
               <Text style={styles.hint}>刻み:</Text>
@@ -331,14 +453,29 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
 
             {/* 結果ボタン */}
             <View style={styles.outcomeRow}>
-              <Button label="成功" size="sm" onPress={() => quickSet(we, 'completed')} style={{ flex: 1 }} />
-              <Button label="潰れた" size="sm" variant="danger" onPress={() => quickSet(we, 'failed')} style={{ flex: 1 }} />
-              <Button label="余力あり" size="sm" variant="secondary" onPress={() => quickSet(we, 'easy')} style={{ flex: 1 }} />
+              <Button label="Done" size="sm" onPress={() => quickSet(we, 'completed')} style={{ flex: 1 }} />
+              <Button label="Failed" size="sm" variant="danger" onPress={() => quickSet(we, 'failed')} style={{ flex: 1 }} />
+              <Button label="Easy" size="sm" variant="secondary" onPress={() => quickSet(we, 'easy')} style={{ flex: 1 }} />
             </View>
             <View style={styles.outcomeRow}>
-              <Button label="5x5 を追加" size="sm" variant="ghost" icon="grid-outline" onPress={() => addBlock(we, '5x5')} style={{ flex: 1.2 }} />
-              <Button label={`同重量×${input.blockSets || 3}`} size="sm" variant="ghost" icon="copy-outline" onPress={() => addBlock(we, 'same_weight_sets')} style={{ flex: 1.2 }} />
-              <Stepper label="" value={input.blockSets} onChange={(v) => setInput(we.id, { blockSets: v })} step={1} decimals={0} min={1} />
+              <Button label="5x5" size="sm" variant="ghost" onPress={() => addBlock(we, '5x5')} style={{ flex: 1 }} />
+              <Button label={`同重量×${input.blockSets || 3}`} size="sm" variant="ghost" onPress={() => addBlock(we, 'same_weight_sets')} style={{ flex: 1.4 }} />
+              {/* セット数のコンパクトカウンター（Stepperだと幅がはみ出すため） */}
+              <View style={styles.counter}>
+                <Pressable
+                  style={styles.counterButton}
+                  onPress={() => setInput(we.id, { blockSets: String(Math.max(1, (Number(input.blockSets) || 3) - 1)) })}
+                >
+                  <Ionicons name="remove" size={16} color={colors.primary} />
+                </Pressable>
+                <Text style={styles.counterText}>{input.blockSets || '3'}</Text>
+                <Pressable
+                  style={styles.counterButton}
+                  onPress={() => setInput(we.id, { blockSets: String(Math.min(10, (Number(input.blockSets) || 3) + 1)) })}
+                >
+                  <Ionicons name="add" size={16} color={colors.primary} />
+                </Pressable>
+              </View>
             </View>
 
             {/* SetBlock達成状況 */}
@@ -368,7 +505,7 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
                     tone={set.outcome === 'failed' ? 'danger' : set.outcome === 'easy' ? 'primary' : 'neutral'}
                   />
                   <Pressable onPress={async () => { await toggleTopSet(we.id, set.id); await load(); }} hitSlop={6}>
-                    <Ionicons name={set.is_selected_top_set ? 'star' : 'star-outline'} size={20} color={set.is_selected_top_set ? '#F59E0B' : colors.faint} />
+                    <Ionicons name={set.is_selected_top_set ? 'star' : 'star-outline'} size={20} color={set.is_selected_top_set ? colors.brass : colors.faint} />
                   </Pressable>
                   <Pressable
                     onPress={() => confirmDelete(`セット ${set.weight}kg × ${set.reps}`, async () => {
@@ -419,13 +556,16 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
 }
 
 // ---- 分析ビュー（種目詳細） ----
+type ChartItem = { date: string; top_weight: number; top_reps: number; estimated_1rm: number; volume: number; gyms: string[]; machines: string[] };
+
 function AnalysisView() {
   const [exercises, setExercises] = useState<Exercise[]>([]);
-  const [gyms, setGyms] = useState<GymLocationRow[]>([]);
   const [selected, setSelected] = useState<Exercise | null>(null);
-  const [gymFilter, setGymFilter] = useState<string | null>(null);
   const [history, setHistory] = useState<ExerciseHistoryItem[]>([]);
-  const [chart, setChart] = useState<Array<{ date: string; top_weight: number; top_reps: number; estimated_1rm: number; volume: number }>>([]);
+  const [chart, setChart] = useState<ChartItem[]>([]);
+  const [detailIndex, setDetailIndex] = useState<number | null>(null);
+  const [machines, setMachines] = useState<EquipmentInstanceRow[]>([]);
+  const [machineFilter, setMachineFilter] = useState<string | null>(null);
   const [frequency, setFrequency] = useState<Array<{ week_start: string; count: number }>>([]);
   const [muscleVolume, setMuscleVolume] = useState<Array<{ muscle_group: string; volume: number }>>([]);
 
@@ -434,19 +574,33 @@ function AnalysisView() {
       setExercises(list);
       if (list.length > 0) setSelected((prev) => prev ?? list[0]);
     });
-    getGymLocations().then(setGyms);
     getWeeklyFrequency(8).then(setFrequency);
     getMuscleVolumeThisWeek().then(setMuscleVolume);
   }, []);
 
   useEffect(() => {
     if (!selected) return;
-    getExerciseHistory(selected.id, 90, gymFilter).then(setHistory);
-    getExerciseCharts(selected.id, gymFilter).then(setChart);
-  }, [selected, gymFilter]);
+    setMachineFilter(null);
+    if (isMachineType(selected.equipment_type)) {
+      getEquipmentInstances(selected.id).then(setMachines);
+    } else {
+      setMachines([]);
+    }
+  }, [selected]);
+
+  useEffect(() => {
+    if (!selected) return;
+    setDetailIndex(null);
+    // 基本は店舗に関わらず一律で表示（店舗差はポイント長押しで確認）。
+    // マシン種目はマシン個体で絞り込める。
+    getExerciseHistory(selected.id, 90, null, machineFilter).then(setHistory);
+    getExerciseCharts(selected.id, null, machineFilter).then(setChart);
+  }, [selected, machineFilter]);
 
   const chartPoints = (key: 'top_weight' | 'estimated_1rm' | 'volume') =>
     chart.map((item) => ({ label: item.date.slice(5), value: item[key] }));
+
+  const detail = detailIndex != null ? chart[detailIndex] ?? null : null;
 
   return (
     <View>
@@ -456,23 +610,58 @@ function AnalysisView() {
         ))}
       </ScrollView>
 
-      {/* 店舗フィルタ */}
-      {gyms.length > 0 ? (
+      {/* マシン個体フィルタ（マシン・ケーブル種目のみ） */}
+      {machines.length > 0 ? (
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
-          <Chip label="全店舗" selected={gymFilter === null} onPress={() => setGymFilter(null)} />
-          {gyms.map((gym) => (
-            <Chip key={gym.id} label={gym.name} selected={gymFilter === gym.id} onPress={() => setGymFilter(gym.id)} />
+          <Chip label="全マシン" selected={machineFilter === null} onPress={() => setMachineFilter(null)} />
+          {machines.map((machine) => (
+            <Chip
+              key={machine.id}
+              label={machine.display_name}
+              sub={machine.gym_name}
+              selected={machineFilter === machine.id}
+              onPress={() => setMachineFilter(machine.id)}
+            />
           ))}
         </ScrollView>
       ) : null}
 
       {selected ? (
         <>
-          <BarChart title="トップセット重量" points={chartPoints('top_weight')} unit="kg" color={colors.primary} baseline="min" />
-          <BarChart title="推定1RM (Epley)" points={chartPoints('estimated_1rm')} unit="kg" color={colors.carbs} baseline="min" />
-          <BarChart title="総重量（volume）" points={chartPoints('volume')} unit="kg" color={colors.fat} />
+          <Text style={styles.hint}>グラフのバーを長押しすると、その日の詳細と店舗・マシンが確認できます</Text>
+          <BarChart title="トップセット重量" points={chartPoints('top_weight')} unit="kg" color={colors.primary} baseline="min" onBarLongPress={setDetailIndex} selectedIndex={detailIndex} />
+          <BarChart title="推定1RM (Epley)" points={chartPoints('estimated_1rm')} unit="kg" color={colors.carbs} baseline="min" onBarLongPress={setDetailIndex} selectedIndex={detailIndex} />
+          <BarChart title="総重量（volume）" points={chartPoints('volume')} unit="kg" color={colors.fat} onBarLongPress={setDetailIndex} selectedIndex={detailIndex} />
+
+          {/* 長押しで選択したポイントの詳細 */}
+          {detail ? (
+            <Card>
+              <View style={styles.sessionHeader}>
+                <Text style={styles.sessionTitle}>{detail.date}</Text>
+                <Pressable onPress={() => setDetailIndex(null)} hitSlop={8}>
+                  <Ionicons name="close" size={18} color={colors.faint} />
+                </Pressable>
+              </View>
+              <Text style={styles.detailLine}>
+                トップセット <Text style={styles.detailStrong}>{detail.top_weight}kg × {detail.top_reps}</Text>
+                　e1RM <Text style={styles.detailStrong}>{detail.estimated_1rm}kg</Text>
+                　総重量 <Text style={styles.detailStrong}>{detail.volume.toLocaleString()}kg</Text>
+              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 }}>
+                <Ionicons name="location-outline" size={15} color={colors.brass} />
+                <Text style={styles.detailGym}>{detail.gyms.length > 0 ? detail.gyms.join(' / ') : '店舗記録なし'}</Text>
+              </View>
+              {detail.machines.length > 0 ? (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                  <Ionicons name="cog-outline" size={15} color={colors.brass} />
+                  <Text style={styles.detailGym}>{detail.machines.join(' / ')}</Text>
+                </View>
+              ) : null}
+            </Card>
+          ) : null}
+
           <SectionTitle>直近ログ</SectionTitle>
-          {history.length === 0 ? <EmptyState icon="analytics-outline" message="この条件の記録はありません" /> : null}
+          {history.length === 0 ? <EmptyState icon="analytics-outline" message="まだ記録がありません" /> : null}
           {history.slice(0, 10).map((item) => (
             <View key={item.date} style={styles.recentRow}>
               <Text style={styles.recentText}>{item.date}</Text>
@@ -506,17 +695,23 @@ const styles = StyleSheet.create({
   historyLine: { color: colors.sub, marginTop: 6, fontSize: 13, fontWeight: '600' },
   exerciseName: { fontSize: 16, fontWeight: '800', color: colors.ink, flexShrink: 1 },
   stepToggleRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
-  stepToggle: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, backgroundColor: '#F1F3F6' },
+  stepToggle: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, backgroundColor: '#23262E' },
   stepToggleActive: { backgroundColor: colors.primarySoft, borderWidth: 1, borderColor: colors.primaryBorder },
   stepToggleText: { fontSize: 12, fontWeight: '700', color: colors.sub },
   stepToggleTextActive: { color: colors.primary },
-  outcomeRow: { flexDirection: 'row', gap: 8, marginTop: 10, alignItems: 'flex-end' },
-  blockRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, backgroundColor: '#F8FAFB', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 8 },
+  outcomeRow: { flexDirection: 'row', gap: 8, marginTop: 10, alignItems: 'center' },
+  counter: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#1A1D23', borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, padding: 2 },
+  counterButton: { width: 32, height: 32, borderRadius: radius.sm, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primarySoft },
+  counterText: { width: 26, textAlign: 'center', color: colors.ink, fontWeight: '800', fontSize: 15 },
+  blockRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, backgroundColor: '#1A1D23', borderRadius: radius.md, paddingHorizontal: 10, paddingVertical: 8 },
   blockText: { fontSize: 13, fontWeight: '700', color: colors.sub, flexShrink: 1 },
-  setRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', minHeight: 42, borderBottomWidth: 1, borderBottomColor: '#F1F3F6' },
+  setRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', minHeight: 42, borderBottomWidth: 1, borderBottomColor: '#23262E' },
   setText: { color: colors.ink, fontSize: 14 },
   setSub: { color: colors.faint, fontSize: 12 },
   setActions: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   recentRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, marginTop: 8 },
-  recentText: { color: colors.sub, fontWeight: '600', fontSize: 13 }
+  recentText: { color: colors.sub, fontWeight: '600', fontSize: 13 },
+  detailLine: { color: colors.sub, marginTop: 10, fontSize: 13, lineHeight: 20 },
+  detailStrong: { color: colors.ink, fontWeight: '800', fontSize: 14 },
+  detailGym: { color: colors.brass, fontWeight: '800', fontSize: 13 }
 });
