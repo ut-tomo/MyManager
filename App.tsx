@@ -1,10 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
-import React, { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, AppState, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { initializeDatabase } from './src/db/client';
-import { scheduleWeeklyReflectionPrompt } from './src/services/notifications';
+import { scheduleWeeklyReflectionPrompt, scheduleWeeklyReviewReadyPrompt } from './src/services/notifications';
+import { syncNow } from './src/services/sync';
 import type { Tab } from './src/navigation';
 import { HomeScreen } from './src/screens/HomeScreen';
 import { ManageScreen } from './src/screens/ManageScreen';
@@ -36,13 +37,31 @@ function Root() {
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState<Tab>('home');
   const [refreshKey, setRefreshKey] = useState(0);
+  const lastForegroundSync = useRef(Date.now());
 
   useEffect(() => {
     initializeDatabase()
-      .then(() => setReady(true))
+      .then(() => {
+        setReady(true);
+        // 起動時に静かに同期（Supabase未設定・オフラインなら何もしない。記録はローカル優先）
+        syncNow().then(() => setRefreshKey((key) => key + 1)).catch(() => null);
+      })
       .catch((error) => Alert.alert('データベースエラー', String(error)));
-    // 日曜20:00「今週の感想を書きませんか？」通知（権限がなければ静かに無視）
+    // 日曜20:00「今週の感想を書きませんか？」/ 22:05「レビュー確認」通知（権限がなければ静かに無視）
     scheduleWeeklyReflectionPrompt().catch(() => null);
+    scheduleWeeklyReviewReadyPrompt().catch(() => null);
+  }, []);
+
+  // バックグラウンドから復帰したとき（例: ジムで記録→帰宅後に開く）にも静かに同期する。
+  // 頻発しないよう5分間隔に間引く。
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      if (Date.now() - lastForegroundSync.current < 5 * 60 * 1000) return;
+      lastForegroundSync.current = Date.now();
+      syncNow().then(() => setRefreshKey((key) => key + 1)).catch(() => null);
+    });
+    return () => sub.remove();
   }, []);
 
   const refresh = useCallback(() => setRefreshKey((key) => key + 1), []);

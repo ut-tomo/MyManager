@@ -4,20 +4,21 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Screen } from '../components/Screen';
 import { Badge, Button, Card, Chip, EmptyState, Field, Segmented, SectionTitle, confirmDelete } from '../components/ui';
 import {
+  addIngredient,
   addIngredientBasedMeal,
   addMealEntry,
-  applyMealTemplate,
   copyMealEntry,
   getDailyNutrition,
   getIngredients,
   getMeals,
-  getMealTemplates,
   getProfile,
   getRecentMealEntries,
+  ingredientPerLabel,
+  ingredientUnitFactor,
   softDelete,
+  updateIngredient,
   updateMealEntry,
-  type IngredientRow,
-  type MealTemplateRow
+  type IngredientRow
 } from '../db/client';
 import { colors } from '../theme';
 import type { Confidence, DailyNutritionSummary, MealEntry, MealType, UserProfile } from '../types';
@@ -34,7 +35,10 @@ const MEAL_TYPE_OPTIONS: Array<{ value: MealType; label: string }> = [
 const MEAL_TYPE_LABEL: Record<string, string> = { breakfast: '朝', lunch: '昼', dinner: '夜', snack: '間食', other: '他' };
 const CONFIDENCE_LABEL: Record<Confidence, string> = { exact: '正確', estimated: '推定', rough: '概算' };
 
-type InputMode = 'manual' | 'template' | 'recent' | 'ingredient';
+type InputMode = 'manual' | 'recent' | 'cook' | 'pantry';
+
+// 食材の単位。'g' は100gあたり、それ以外は1単位あたりで栄養値を登録する
+const UNIT_OPTIONS = ['g', '個', '本', 'パック', '枚', '杯'];
 
 export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refreshKey: number }) {
   const [meals, setMeals] = useState<MealEntry[]>([]);
@@ -53,32 +57,34 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
   const [confidence, setConfidence] = useState<Confidence>('estimated');
   const [note, setNote] = useState('');
 
-  // テンプレート
-  const [templates, setTemplates] = useState<MealTemplateRow[]>([]);
-  const [multiplier, setMultiplier] = useState<'0.5' | '1' | '1.5' | 'custom'>('1');
-  const [customMultiplier, setCustomMultiplier] = useState('1.2');
-
   // 最近から
   const [recent, setRecent] = useState<MealEntry[]>([]);
 
-  // 材料ベース
+  // 自炊（食材のコンビネーション）
   const [ingredients, setIngredients] = useState<IngredientRow[]>([]);
-  const [ingredientRows, setIngredientRows] = useState<Array<{ ingredient: IngredientRow; grams: string }>>([]);
+  const [ingredientRows, setIngredientRows] = useState<Array<{ ingredient: IngredientRow; amount: string }>>([]);
   const [ingredientMealName, setIngredientMealName] = useState('');
 
+  // 食材の登録・編集
+  const [editingIngredient, setEditingIngredient] = useState<IngredientRow | null>(null);
+  const [ingName, setIngName] = useState('');
+  const [ingUnit, setIngUnit] = useState('g');
+  const [ingKcal, setIngKcal] = useState('');
+  const [ingProtein, setIngProtein] = useState('');
+  const [ingFat, setIngFat] = useState('');
+  const [ingCarbs, setIngCarbs] = useState('');
+
   const load = useCallback(async () => {
-    const [m, n, p, t, r, i] = await Promise.all([
+    const [m, n, p, r, i] = await Promise.all([
       getMeals(),
       getDailyNutrition(),
       getProfile(),
-      getMealTemplates(),
       getRecentMealEntries(),
       getIngredients()
     ]);
     setMeals(m);
     setNutrition(n);
     setProfile(p);
-    setTemplates(t);
     setRecent(r);
     setIngredients(i);
   }, []);
@@ -139,14 +145,6 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
     setNote(meal.note ?? '');
   }
 
-  async function applyTemplate(template: MealTemplateRow) {
-    const factor = multiplier === 'custom' ? Number(customMultiplier) : Number(multiplier);
-    if (!Number.isFinite(factor) || factor <= 0) return;
-    await applyMealTemplate(template, mealType, factor);
-    await load();
-    refresh();
-  }
-
   async function copyRecent(meal: MealEntry) {
     await copyMealEntry(meal, mealType);
     await load();
@@ -155,17 +153,18 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
 
   function addIngredientRow(ingredient: IngredientRow) {
     if (ingredientRows.some((row) => row.ingredient.id === ingredient.id)) return;
-    setIngredientRows((rows) => [...rows, { ingredient, grams: '100' }]);
+    // gの食材は100g、個数系は1をデフォルト量にする
+    setIngredientRows((rows) => [...rows, { ingredient, amount: ingredient.default_unit === 'g' ? '100' : '1' }]);
   }
 
   const ingredientTotals = ingredientRows.reduce(
     (sum, row) => {
-      const grams = Number(row.grams) || 0;
+      const factor = ingredientUnitFactor(row.ingredient, Number(row.amount) || 0);
       return {
-        kcal: sum.kcal + (row.ingredient.calories_per_100g * grams) / 100,
-        protein: sum.protein + (row.ingredient.protein_per_100g * grams) / 100,
-        fat: sum.fat + (row.ingredient.fat_per_100g * grams) / 100,
-        carbs: sum.carbs + (row.ingredient.carbs_per_100g * grams) / 100
+        kcal: sum.kcal + row.ingredient.calories_per_100g * factor,
+        protein: sum.protein + row.ingredient.protein_per_100g * factor,
+        fat: sum.fat + row.ingredient.fat_per_100g * factor,
+        carbs: sum.carbs + row.ingredient.carbs_per_100g * factor
       };
     },
     { kcal: 0, protein: 0, fat: 0, carbs: 0 }
@@ -174,14 +173,53 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
   async function saveIngredientMeal() {
     if (!ingredientMealName.trim() || ingredientRows.length === 0) return;
     const rows = ingredientRows
-      .map((row) => ({ ingredient: row.ingredient, grams: Number(row.grams) || 0 }))
-      .filter((row) => row.grams > 0);
+      .map((row) => ({ ingredient: row.ingredient, amount: Number(row.amount) || 0 }))
+      .filter((row) => row.amount > 0);
     if (rows.length === 0) return;
     await addIngredientBasedMeal(ingredientMealName.trim(), mealType, rows);
     setIngredientMealName('');
     setIngredientRows([]);
     await load();
     refresh();
+  }
+
+  function resetIngredientForm() {
+    setEditingIngredient(null);
+    setIngName('');
+    setIngUnit('g');
+    setIngKcal('');
+    setIngProtein('');
+    setIngFat('');
+    setIngCarbs('');
+  }
+
+  async function saveIngredient() {
+    if (!ingName.trim() || !Number(ingKcal)) return;
+    const input = {
+      name: ingName.trim(),
+      calories_per_100g: Number(ingKcal),
+      protein_per_100g: Number(ingProtein) || 0,
+      fat_per_100g: Number(ingFat) || 0,
+      carbs_per_100g: Number(ingCarbs) || 0,
+      default_unit: ingUnit
+    };
+    if (editingIngredient) {
+      await updateIngredient(editingIngredient.id, input);
+    } else {
+      await addIngredient(input);
+    }
+    resetIngredientForm();
+    await load();
+  }
+
+  function startEditIngredient(ingredient: IngredientRow) {
+    setEditingIngredient(ingredient);
+    setIngName(ingredient.name);
+    setIngUnit(ingredient.default_unit);
+    setIngKcal(String(ingredient.calories_per_100g));
+    setIngProtein(String(ingredient.protein_per_100g));
+    setIngFat(String(ingredient.fat_per_100g));
+    setIngCarbs(String(ingredient.carbs_per_100g));
   }
 
   const missingTotal = (nutrition?.missingProtein ?? 0) + (nutrition?.missingFat ?? 0) + (nutrition?.missingCarbs ?? 0);
@@ -210,9 +248,9 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
         value={mode}
         options={[
           { value: 'manual', label: '概算' },
-          { value: 'template', label: 'テンプレ' },
           { value: 'recent', label: '最近から' },
-          { value: 'ingredient', label: '材料' }
+          { value: 'cook', label: '自炊' },
+          { value: 'pantry', label: '食材' }
         ]}
         onChange={(m) => {
           setMode(m);
@@ -230,9 +268,9 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
               </Pressable>
             </View>
           ) : null}
-          <Field label="食事名" value={name} onChangeText={setName} placeholder="例: つけ麺 大盛り" />
+          <Field label="食事名" value={name} onChangeText={setName} />
           <View style={styles.rowGap}>
-            <Field label="kcal（必須）" value={calories} onChangeText={setCalories} placeholder="1100" keyboardType="number-pad" flex />
+            <Field label="kcal（必須）" value={calories} onChangeText={setCalories} keyboardType="number-pad" flex />
             <Field label="P (g)" value={protein} onChangeText={setProtein} placeholder="-" keyboardType="decimal-pad" flex />
             <Field label="F (g)" value={fat} onChangeText={setFat} placeholder="-" keyboardType="decimal-pad" flex />
             <Field label="C (g)" value={carbs} onChangeText={setCarbs} placeholder="-" keyboardType="decimal-pad" flex />
@@ -247,39 +285,8 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
             ]}
             onChange={setConfidence}
           />
-          <Field label="メモ（任意）" value={note} onChangeText={setNote} placeholder="スープは半分残した など" />
+          <Field label="メモ（任意）" value={note} onChangeText={setNote} />
           <Button label={editing ? '更新する' : '保存する'} icon="checkmark" size="lg" onPress={saveManual} style={{ marginTop: 14 }} />
-        </Card>
-      ) : null}
-
-      {mode === 'template' ? (
-        <Card>
-          <Text style={styles.fieldLabel}>倍率</Text>
-          <Segmented
-            value={multiplier}
-            options={[
-              { value: '0.5', label: '0.5倍' },
-              { value: '1', label: '1.0倍' },
-              { value: '1.5', label: '1.5倍' },
-              { value: 'custom', label: 'カスタム' }
-            ]}
-            onChange={setMultiplier}
-          />
-          {multiplier === 'custom' ? (
-            <Field label="カスタム倍率" value={customMultiplier} onChangeText={setCustomMultiplier} keyboardType="decimal-pad" />
-          ) : null}
-          {templates.length === 0 ? <EmptyState icon="bookmark-outline" message="テンプレートは設定画面から登録できます" /> : null}
-          {templates.map((template) => (
-            <Pressable key={template.id} style={styles.pickRow} onPress={() => applyTemplate(template)}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.pickTitle}>{template.name}</Text>
-                <Text style={styles.pickSub}>
-                  {template.default_calories_kcal}kcal / P{template.default_protein_g ?? '-'} F{template.default_fat_g ?? '-'} C{template.default_carbs_g ?? '-'}
-                </Text>
-              </View>
-              <Ionicons name="add-circle" size={26} color={colors.primary} />
-            </Pressable>
-          ))}
         </Card>
       ) : null}
 
@@ -300,29 +307,33 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
         </Card>
       ) : null}
 
-      {mode === 'ingredient' ? (
+      {mode === 'cook' ? (
         <Card>
-          <Field label="食事名" value={ingredientMealName} onChangeText={setIngredientMealName} placeholder="例: 鶏むね丼" />
-          <Text style={styles.fieldLabel}>食材を追加（設定画面で登録できます）</Text>
+          <Field label="食事名" value={ingredientMealName} onChangeText={setIngredientMealName} />
+          <Text style={styles.fieldLabel}>食材をタップして追加</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
             {ingredients.map((ingredient) => (
-              <Chip key={ingredient.id} label={ingredient.name} sub={`${ingredient.calories_per_100g}kcal/100g`} onPress={() => addIngredientRow(ingredient)} />
+              <Chip
+                key={ingredient.id}
+                label={ingredient.name}
+                sub={`${ingredient.calories_per_100g}kcal/${ingredientPerLabel(ingredient)}`}
+                onPress={() => addIngredientRow(ingredient)}
+              />
             ))}
           </ScrollView>
-          {ingredients.length === 0 ? <EmptyState icon="nutrition-outline" message="食材が未登録です" /> : null}
+          {ingredients.length === 0 ? <EmptyState icon="nutrition-outline" message="「食材」タブから食材を登録してください" /> : null}
           {ingredientRows.map((row, index) => (
             <View key={row.ingredient.id} style={styles.ingredientRow}>
               <Text style={styles.pickTitle}>{row.ingredient.name}</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                 <View style={{ width: 88 }}>
                   <Field
-                    value={row.grams}
-                    onChangeText={(v) => setIngredientRows((rows) => rows.map((r, i) => (i === index ? { ...r, grams: v } : r)))}
-                    keyboardType="number-pad"
-                    placeholder="g"
+                    value={row.amount}
+                    onChangeText={(v) => setIngredientRows((rows) => rows.map((r, i) => (i === index ? { ...r, amount: v } : r)))}
+                    keyboardType="decimal-pad"
                   />
                 </View>
-                <Text style={styles.pickSub}>g</Text>
+                <Text style={styles.pickSub}>{row.ingredient.default_unit}</Text>
                 <Pressable onPress={() => setIngredientRows((rows) => rows.filter((_, i) => i !== index))} hitSlop={6}>
                   <Ionicons name="close-circle" size={22} color={colors.faint} />
                 </Pressable>
@@ -338,6 +349,63 @@ export function MealScreen({ refresh, refreshKey }: { refresh: () => void; refre
             </>
           ) : null}
         </Card>
+      ) : null}
+
+      {mode === 'pantry' ? (
+        <>
+          <Card>
+            {editingIngredient ? (
+              <View style={styles.editingBanner}>
+                <Badge label={`「${editingIngredient.name}」を編集中`} tone="warn" />
+                <Pressable onPress={resetIngredientForm} hitSlop={8}>
+                  <Text style={styles.cancelText}>キャンセル</Text>
+                </Pressable>
+              </View>
+            ) : null}
+            <Field label="食材名" value={ingName} onChangeText={setIngName} placeholder="例: 鶏むね肉（皮なし）" />
+            <Text style={styles.fieldLabel}>単位</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {UNIT_OPTIONS.map((unit) => (
+                <Chip key={unit} label={unit} selected={ingUnit === unit} onPress={() => setIngUnit(unit)} />
+              ))}
+            </ScrollView>
+            <Text style={styles.fieldLabel}>
+              {ingUnit === 'g' ? '100gあたり' : `1${ingUnit}あたり`}の栄養値
+            </Text>
+            <View style={styles.rowGap}>
+              <Field label="kcal" value={ingKcal} onChangeText={setIngKcal} keyboardType="decimal-pad" flex />
+              <Field label="P (g)" value={ingProtein} onChangeText={setIngProtein} keyboardType="decimal-pad" flex />
+              <Field label="F (g)" value={ingFat} onChangeText={setIngFat} keyboardType="decimal-pad" flex />
+              <Field label="C (g)" value={ingCarbs} onChangeText={setIngCarbs} keyboardType="decimal-pad" flex />
+            </View>
+            <Button label={editingIngredient ? '更新する' : '追加する'} icon="checkmark" onPress={saveIngredient} style={{ marginTop: 12 }} />
+          </Card>
+          {ingredients.length === 0 ? <EmptyState icon="nutrition-outline" message="登録した食材は「自炊」タブで組み合わせて使えます" /> : null}
+          {ingredients.map((ingredient) => (
+            <View key={ingredient.id} style={styles.mealRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.pickTitle}>{ingredient.name}</Text>
+                <Text style={styles.pickSub}>
+                  {ingredient.calories_per_100g}kcal / P{ingredient.protein_per_100g} F{ingredient.fat_per_100g} C{ingredient.carbs_per_100g}（{ingredientPerLabel(ingredient)}あたり）
+                </Text>
+              </View>
+              <View style={{ flexDirection: 'row', gap: 12, alignItems: 'center' }}>
+                <Pressable onPress={() => startEditIngredient(ingredient)} hitSlop={6}>
+                  <Ionicons name="pencil" size={18} color={colors.sub} />
+                </Pressable>
+                <Pressable
+                  onPress={() => confirmDelete(ingredient.name, async () => {
+                    await softDelete('ingredients', ingredient.id);
+                    await load();
+                  })}
+                  hitSlop={6}
+                >
+                  <Ionicons name="trash-outline" size={18} color={colors.faint} />
+                </Pressable>
+              </View>
+            </View>
+          ))}
+        </>
       ) : null}
 
       {/* 今日の食事一覧 */}

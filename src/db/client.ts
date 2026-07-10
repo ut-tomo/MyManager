@@ -381,6 +381,18 @@ export type IngredientRow = {
   note?: string | null;
 };
 
+// 単位の解釈: default_unit が 'g' なら *_per_100g は「100gあたり」、
+// それ以外（個・本・パックなど）は「1単位あたり」の栄養値として扱う。
+// amount（g数 or 個数）から掛け係数を返す。
+export function ingredientUnitFactor(ingredient: Pick<IngredientRow, 'default_unit'>, amount: number): number {
+  return ingredient.default_unit === 'g' ? amount / 100 : amount;
+}
+
+// 「100gあたり」「1個あたり」のような表示ラベル
+export function ingredientPerLabel(ingredient: Pick<IngredientRow, 'default_unit'>): string {
+  return ingredient.default_unit === 'g' ? '100g' : `1${ingredient.default_unit}`;
+}
+
 export async function getIngredients(): Promise<IngredientRow[]> {
   return db.getAllAsync<IngredientRow>(`SELECT * FROM ingredients WHERE deleted_at IS NULL ORDER BY name`);
 }
@@ -520,13 +532,28 @@ export async function getDailyNutrition(date = todayISO()): Promise<DailyNutriti
 }
 
 export async function addBodyWeightLog(weightKg: number, date = todayISO(), note?: string): Promise<string> {
-  const id = newId('bw');
   const now = nowISO();
-  await db.runAsync(
-    `INSERT INTO body_weight_logs (id, date, weight_kg, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
-    [id, date, Math.round(weightKg * 10) / 10, note ?? null, now, now]
+  const rounded = Math.round(weightKg * 10) / 10;
+  // 同じ日に2回保存したら上書き。重複行があると7日移動平均とグラフが歪むため。
+  const existing = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM body_weight_logs WHERE date = ? AND deleted_at IS NULL LIMIT 1`,
+    [date]
   );
-  await updateProfile({ current_weight_kg: Math.round(weightKg * 10) / 10 });
+  let id: string;
+  if (existing) {
+    id = existing.id;
+    await db.runAsync(
+      `UPDATE body_weight_logs SET weight_kg = ?, note = COALESCE(?, note), sync_status = CASE WHEN sync_status = 'synced' THEN 'modified' ELSE sync_status END, updated_at = ? WHERE id = ?`,
+      [rounded, note ?? null, now, id]
+    );
+  } else {
+    id = newId('bw');
+    await db.runAsync(
+      `INSERT INTO body_weight_logs (id, date, weight_kg, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, date, rounded, note ?? null, now, now]
+    );
+  }
+  await updateProfile({ current_weight_kg: rounded });
   return id;
 }
 
@@ -583,6 +610,8 @@ export async function getExerciseHistory(
     params
   );
   const byDate = new Map<string, ExerciseHistoryItem>();
+  // ★で選択したトップセットがある日は、それをe1RM最大のセットより優先する
+  const selectedDates = new Set<string>();
   for (const row of rows) {
     const current = byDate.get(row.date) ?? {
       date: row.date,
@@ -598,11 +627,14 @@ export async function getExerciseHistory(
     current.total_volume += row.weight * row.reps * row.volume_multiplier;
     if (row.gym_name && !current.gyms.includes(row.gym_name)) current.gyms.push(row.gym_name);
     if (row.machine_name && !current.machines.includes(row.machine_name)) current.machines.push(row.machine_name);
-    if (row.is_selected_top_set || current.top_weight == null || epley1rm(row.weight, row.reps) > (current.estimated_1rm ?? 0)) {
+    const isSelected = !!row.is_selected_top_set;
+    const beatsCurrent = current.top_weight == null || epley1rm(row.weight, row.reps) > (current.estimated_1rm ?? 0);
+    if (isSelected || (!selectedDates.has(row.date) && beatsCurrent)) {
       current.top_weight = row.weight;
       current.top_reps = row.reps;
       current.estimated_1rm = epley1rm(row.weight, row.reps);
     }
+    if (isSelected) selectedDates.add(row.date);
     byDate.set(row.date, current);
   }
   return [...byDate.values()].map((item) => ({
@@ -774,6 +806,12 @@ export async function getGymLocations(): Promise<GymLocationRow[]> {
 }
 
 export async function addGymLocation(name: string, note?: string): Promise<string> {
+  // 同名店舗の重複登録は既存のIDを返す（チップが二重に並ぶのを防ぐ）
+  const existing = await db.getFirstAsync<{ id: string }>(
+    `SELECT id FROM gym_locations WHERE name = ? AND deleted_at IS NULL LIMIT 1`,
+    [name]
+  );
+  if (existing) return existing.id;
   const id = newId('gym');
   const now = nowISO();
   await db.runAsync(
@@ -945,19 +983,22 @@ export async function applyMealTemplate(
   });
 }
 
-// 材料ベースの食事: 食材×グラムから合計を計算して保存
+// 自炊の食事: 食材×量（g数 or 個数）の組み合わせから合計を計算して保存
 export async function addIngredientBasedMeal(
   name: string,
   mealType: MealEntry['meal_type'],
-  rows: Array<{ ingredient: IngredientRow; grams: number }>
+  rows: Array<{ ingredient: IngredientRow; amount: number }>
 ): Promise<string> {
   const totals = rows.reduce(
-    (sum, row) => ({
-      calories: sum.calories + (row.ingredient.calories_per_100g * row.grams) / 100,
-      protein: sum.protein + (row.ingredient.protein_per_100g * row.grams) / 100,
-      fat: sum.fat + (row.ingredient.fat_per_100g * row.grams) / 100,
-      carbs: sum.carbs + (row.ingredient.carbs_per_100g * row.grams) / 100
-    }),
+    (sum, row) => {
+      const factor = ingredientUnitFactor(row.ingredient, row.amount);
+      return {
+        calories: sum.calories + row.ingredient.calories_per_100g * factor,
+        protein: sum.protein + row.ingredient.protein_per_100g * factor,
+        fat: sum.fat + row.ingredient.fat_per_100g * factor,
+        carbs: sum.carbs + row.ingredient.carbs_per_100g * factor
+      };
+    },
     { calories: 0, protein: 0, fat: 0, carbs: 0 }
   );
   const mealId = await addMealEntry({
@@ -975,6 +1016,8 @@ export async function addIngredientBasedMeal(
   });
   const now = nowISO();
   for (const row of rows) {
+    const factor = ingredientUnitFactor(row.ingredient, row.amount);
+    // amount_g には食材の単位での量を入れる（gの食材はg数、個数系の食材は個数）
     await db.runAsync(
       `INSERT INTO meal_ingredients (id, meal_entry_id, ingredient_id, amount_g, calories_kcal, protein_g, fat_g, carbs_g, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -982,11 +1025,11 @@ export async function addIngredientBasedMeal(
         newId('mi'),
         mealId,
         row.ingredient.id,
-        row.grams,
-        Math.round((row.ingredient.calories_per_100g * row.grams) / 100),
-        round1((row.ingredient.protein_per_100g * row.grams) / 100),
-        round1((row.ingredient.fat_per_100g * row.grams) / 100),
-        round1((row.ingredient.carbs_per_100g * row.grams) / 100),
+        row.amount,
+        Math.round(row.ingredient.calories_per_100g * factor),
+        round1(row.ingredient.protein_per_100g * factor),
+        round1(row.ingredient.fat_per_100g * factor),
+        round1(row.ingredient.carbs_per_100g * factor),
         now,
         now
       ]

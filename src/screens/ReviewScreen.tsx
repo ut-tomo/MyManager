@@ -71,7 +71,6 @@ export function ReviewScreen({ refreshKey }: { refreshKey: number }) {
         <Field
           value={reflection}
           onChangeText={setReflection}
-          placeholder="例: 今週は脚が重かった。ベンチは調子良かったが、睡眠が短かった。"
           multiline
         />
         <Button label="感想を保存" icon="document-text-outline" onPress={saveReflection} style={{ marginTop: 12 }} />

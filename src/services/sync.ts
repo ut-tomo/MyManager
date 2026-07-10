@@ -1,5 +1,12 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { db } from '../db/client';
 import { supabase } from './supabase';
+
+const LAST_SYNC_KEY = 'my_manager_last_sync_at';
+
+export async function getLastSyncAt(): Promise<string | null> {
+  return AsyncStorage.getItem(LAST_SYNC_KEY);
+}
 
 const SYNC_TABLES = [
   'gym_locations',
@@ -49,7 +56,25 @@ export async function pushLocalChanges(): Promise<SyncResult> {
     );
     if (rows.length === 0) continue;
 
-    const { error } = await supabase.from(table).upsert(rows, { onConflict: 'id' });
+    // ローカルはTEXTでJSONを持つが、Postgres側はjsonb。
+    // 文字列のまま送ると二重エンコードになるため、_json列はオブジェクトに戻して送る。
+    const payload = rows.map((row) => {
+      const out: Record<string, unknown> = { ...row };
+      for (const key of Object.keys(out)) {
+        if (key.endsWith('_json') && typeof out[key] === 'string') {
+          try {
+            out[key] = JSON.parse(out[key] as string);
+          } catch {
+            // JSONとして不正ならそのまま送る
+          }
+        }
+      }
+      // 'modified'のまま送るとpull時に同期済みの行が未同期へ戻ってしまう
+      out.sync_status = 'synced';
+      return out;
+    });
+
+    const { error } = await supabase.from(table).upsert(payload, { onConflict: 'id' });
     if (error) {
       result.errors.push({ table, message: error.message });
       continue;
@@ -81,16 +106,27 @@ export async function pullRemoteTable(table: (typeof SYNC_TABLES)[number]): Prom
       if (localTime > remoteTime) continue;
     }
 
+    // サーバー由来の行はローカルでは常に「同期済み」。過去に'modified'のまま
+    // 保存されたサーバー行を取り込んでも未同期へ戻らないよう強制する。
+    row.sync_status = 'synced';
     const keys = Object.keys(row);
     const placeholders = keys.map(() => '?').join(', ');
     const updates = keys.map((key) => `${key} = excluded.${key}`).join(', ');
     await db.runAsync(
       `INSERT INTO ${table} (${keys.join(', ')}) VALUES (${placeholders})
        ON CONFLICT(id) DO UPDATE SET ${updates}`,
-      keys.map((key) => row[key] as SQLiteBindValue)
+      keys.map((key) => toBindValue(row[key]))
     );
   }
   return data.length;
+}
+
+// Postgresのjsonb（オブジェクト/配列）やbooleanはSQLiteに直接バインドできないため変換する
+function toBindValue(value: unknown): SQLiteBindValue {
+  if (value == null) return null;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (typeof value === 'object') return JSON.stringify(value);
+  return value as string | number;
 }
 
 export async function syncNow(): Promise<SyncResult> {
@@ -98,6 +134,9 @@ export async function syncNow(): Promise<SyncResult> {
   if (pushed.errors.length > 0) return pushed;
   for (const table of SYNC_TABLES) {
     await pullRemoteTable(table);
+  }
+  if (supabase) {
+    await AsyncStorage.setItem(LAST_SYNC_KEY, new Date().toISOString()).catch(() => null);
   }
   return pushed;
 }

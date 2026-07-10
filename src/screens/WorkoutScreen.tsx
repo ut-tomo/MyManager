@@ -36,6 +36,7 @@ import {
   type GymLocationRow,
   type SetBlockSummary
 } from '../db/client';
+import { cancelWorkoutCheckoutReminder, scheduleWorkoutCheckoutReminder } from '../services/notifications';
 import { colors, radius } from '../theme';
 import type { Exercise, ExerciseHistoryItem, WorkoutExercise, WorkoutSession, WorkoutSet } from '../types';
 import { combineDateTime, timeHM } from '../utils/date';
@@ -158,6 +159,8 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
       return null;
     }
     const id = await startWorkoutSession(selectedGymId);
+    // 終了ボタンの押し忘れ対策: 3時間後にリマインド（権限がなければ静かに無視）
+    scheduleWorkoutCheckoutReminder().catch(() => null);
     await load();
     refresh();
     return id;
@@ -255,6 +258,8 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
       ended_at: endHM ? ended : undefined,
       duration_minutes: duration !== undefined && Number.isFinite(duration) ? duration : undefined
     });
+    // 終了時刻を手入力した場合もリマインドは不要になる
+    if (endHM) cancelWorkoutCheckoutReminder().catch(() => null);
     setTimeEditOpen(false);
     await load();
     refresh();
@@ -296,6 +301,7 @@ function LogView({ refresh, refreshKey }: { refresh: () => void; refreshKey: num
                 icon="stop-circle-outline"
                 onPress={async () => {
                   await finishWorkoutSession(active.id);
+                  cancelWorkoutCheckoutReminder().catch(() => null);
                   await load();
                   refresh();
                 }}
